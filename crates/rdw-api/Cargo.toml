@@ -1,0 +1,33 @@
+[package]
+name = "rdw-api"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "rdw_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rdw-api"
+path = "src/main.rs"
+
+[dependencies]
+rdw-client = { path = "../rdw-client" }
+rdw-core = { path = "../rdw-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower-http = { workspace = true, features = ["trace"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+reqwest = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
