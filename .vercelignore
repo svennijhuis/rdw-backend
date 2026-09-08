@@ -1,0 +1,8 @@
+# The container image is built from source by the Dockerfile, so local build
+# artifacts must never be uploaded. target/ reaches several GB after a release
+# build and will stall the deploy if it is included.
+target
+.git
+.env
+.env.local
+docs
