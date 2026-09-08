@@ -9,7 +9,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rdw_api::state::AppState;
 use rdw_client::{RdwClient, RetryConfig};
-use rdw_core::{ColumnMetadata, FailureConfig};
+use rdw_core::{Column, ColumnMetadata, FailureConfig};
 use serde_json::json;
 use tower::ServiceExt;
 use wiremock::matchers::{method, path};
@@ -19,11 +19,14 @@ const API_KEY: &str = "test-key-123";
 
 fn test_metadata() -> ColumnMetadata {
     ColumnMetadata {
-        vehicle_columns: vec!["kenteken".to_string(), "merk".to_string()],
+        vehicle_columns: vec![
+            Column::new("kenteken", "Kenteken"),
+            Column::new("merk", "Merk"),
+        ],
         fuel_columns: vec![
-            "kenteken".to_string(),
-            "brandstof_volgnummer".to_string(),
-            "brandstof_omschrijving".to_string(),
+            Column::new("kenteken", "Kenteken"),
+            Column::new("brandstof_volgnummer", "Brandstof volgnummer"),
+            Column::new("brandstof_omschrijving", "Brandstof omschrijving"),
         ],
         used_fallback: false,
     }
@@ -123,7 +126,7 @@ async fn happy_path_valid_request_returns_csv() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
     let body = body_string(response).await;
-    assert!(body.contains("kenteken,merk"));
+    assert!(body.contains("Kenteken,Merk"));
     assert!(body.contains("AA001A,TOYOTA,1,Benzine"));
 }
 
@@ -243,7 +246,7 @@ async fn failure_fourth_fuel_entry_causes_502_and_sends_no_csv() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = body_string(response).await;
     assert!(
-        !body.contains("kenteken,merk"),
+        !body.contains("Kenteken,Merk"),
         "no CSV bytes must be sent on a data-integrity failure"
     );
 }
@@ -277,7 +280,7 @@ async fn failure_vehicle_page_failure_returns_502_not_partial_csv() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = body_string(response).await;
     assert!(
-        !body.contains("kenteken,merk"),
+        !body.contains("Kenteken,Merk"),
         "no CSV bytes must be sent when the vehicle page itself fails"
     );
 }
@@ -313,7 +316,7 @@ async fn fuel_page_failure_below_threshold_returns_200_partial_csv() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
-    assert!(body.contains("export_status"));
+    assert!(body.contains("Export status"));
     assert!(body.contains("fuel_unavailable"));
 }
 
@@ -350,7 +353,7 @@ async fn fuel_page_failure_above_threshold_returns_502() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = body_string(response).await;
     assert!(
-        !body.contains("kenteken,merk"),
+        !body.contains("Kenteken,Merk"),
         "no CSV bytes must be sent once the fuel-failure threshold is exceeded"
     );
 }

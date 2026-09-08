@@ -349,9 +349,19 @@ impl RdwClient {
     }
 
     /// Fetch and parse the RDW dataset metadata used for CSV column headers.
+    ///
+    /// Returns each column as `(field_name, display_name)`. `fieldName` is the
+    /// machine key used to read values out of a data row; `name` is RDW's own
+    /// human-readable label, which is what the CSV header shows, so a reader
+    /// sees "Gemiddelde Lading Waarde" instead of `gem_lading_wrde`. A column
+    /// without a `name` falls back to its `fieldName` rather than failing.
+    ///
     /// Callers apply their own fallback when this fails; this function only
     /// reports the raw error.
-    pub async fn fetch_column_names(&self, dataset_id: &str) -> Result<Vec<String>, ClientError> {
+    pub async fn fetch_column_names(
+        &self,
+        dataset_id: &str,
+    ) -> Result<Vec<(String, String)>, ClientError> {
         let url = format!("{}/{dataset_id}.json", self.metadata_base);
         let body = with_retry(&self.retry_config, || self.get(&url)).await?;
         let value: Value =
@@ -363,10 +373,16 @@ impl RdwClient {
         columns
             .iter()
             .map(|c| {
-                c.get("fieldName")
+                let field = c
+                    .get("fieldName")
                     .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .ok_or_else(|| ClientError::Decode("column missing fieldName".to_string()))
+                    .ok_or_else(|| ClientError::Decode("column missing fieldName".to_string()))?;
+                let display = c
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(field)
+                    .to_string();
+                Ok((field.to_string(), display))
             })
             .collect()
     }
@@ -778,8 +794,9 @@ mod tests {
             .and(path("/m9d7-ebf2.json"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "columns": [
-                    { "fieldName": "kenteken" },
-                    { "fieldName": "merk" }
+                    { "fieldName": "kenteken", "name": "Kenteken" },
+                    { "fieldName": "merk", "name": "Merk" },
+                    { "fieldName": "gem_lading_wrde" }
                 ]
             })))
             .mount(&server)
@@ -787,7 +804,16 @@ mod tests {
 
         let client = fast_client().with_metadata_base(server.uri());
         let columns = client.fetch_column_names("m9d7-ebf2").await.unwrap();
-        assert_eq!(columns, vec!["kenteken".to_string(), "merk".to_string()]);
+        assert_eq!(
+            columns,
+            vec![
+                ("kenteken".to_string(), "Kenteken".to_string()),
+                ("merk".to_string(), "Merk".to_string()),
+                // No `name` in the metadata: the fieldName stands in rather
+                // than the column being dropped or the fetch failing.
+                ("gem_lading_wrde".to_string(), "gem_lading_wrde".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

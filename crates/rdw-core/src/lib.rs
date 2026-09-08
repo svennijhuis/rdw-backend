@@ -13,7 +13,7 @@ pub use csv_writer::{assemble, cleanup, Assembled, Assembler, EXCEL_MAX_DATA_ROW
 pub use failure::{FailedRange, FailureConfig, FuelFailureSummary};
 pub use merge::{merge_join, ExportStatus, MergeJoinError, WidenedRow, MAX_FUEL_ENTRIES};
 pub use metadata::{
-    fallback_fuel_columns, fallback_vehicle_columns, load_column_metadata, ColumnMetadata,
+    fallback_fuel_columns, fallback_vehicle_columns, load_column_metadata, Column, ColumnMetadata,
 };
 pub use rate_limit::{RateLimitOutcome, RateLimiter, DAY_LIMIT, WEEK_LIMIT};
-pub use widen::RowWidener;
+pub use widen::{RowWidener, EXPORT_STATUS_HEADER};

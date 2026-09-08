@@ -5,21 +5,26 @@
 //! `merge::merge_join`), rather than emitting a separate fuel sheet.
 
 use crate::merge::{WidenedRow, MAX_FUEL_ENTRIES};
+use crate::metadata::Column;
+
+/// Header label for the export-status column. Kept as a named constant so the
+/// header and any consumer looking the column up cannot drift apart.
+pub const EXPORT_STATUS_HEADER: &str = "Export status";
 
 /// Column layout used to build the CSV header and to widen each row into
 /// exactly that column order.
 pub struct RowWidener {
-    vehicle_columns: Vec<String>,
+    vehicle_columns: Vec<Column>,
     /// Fuel dataset columns excluding `kenteken` (the join key, already
     /// present via the vehicle columns).
-    fuel_columns: Vec<String>,
+    fuel_columns: Vec<Column>,
 }
 
 impl RowWidener {
-    pub fn new(vehicle_columns: Vec<String>, fuel_columns: Vec<String>) -> Self {
+    pub fn new(vehicle_columns: Vec<Column>, fuel_columns: Vec<Column>) -> Self {
         let fuel_columns = fuel_columns
             .into_iter()
-            .filter(|c| c != "kenteken")
+            .filter(|c| c.field != "kenteken")
             .collect();
         Self {
             vehicle_columns,
@@ -27,19 +32,28 @@ impl RowWidener {
         }
     }
 
-    /// Header row: vehicle columns, then `fuel1_*`, `fuel2_*`, `fuel3_*`,
-    /// then `export_status` last. The status column's position is final: it
-    /// must never move earlier, because `widen()` builds rows positionally
-    /// and existing consumers (and tests) assert fixed column indices for
-    /// the 203-wide vehicle+fuel prefix.
+    /// Header row: vehicle columns, then each fuel slot, then the export
+    /// status last. The status column's position is final: it must never move
+    /// earlier, because `widen()` builds rows positionally and existing
+    /// consumers (and tests) assert fixed column indices for the 203-wide
+    /// vehicle+fuel prefix.
+    ///
+    /// Headers use RDW's own display names rather than its `fieldName` keys,
+    /// so a reader opening the CSV sees "Gemiddelde Lading Waarde" instead of
+    /// `gem_lading_wrde`. Fuel slots are prefixed "Brandstof N - " so all the
+    /// columns of one slot sort together.
     pub fn header(&self) -> Vec<String> {
-        let mut header = self.vehicle_columns.clone();
+        let mut header: Vec<String> = self
+            .vehicle_columns
+            .iter()
+            .map(|c| c.display.clone())
+            .collect();
         for slot in 1..=MAX_FUEL_ENTRIES {
             for col in &self.fuel_columns {
-                header.push(format!("fuel{slot}_{col}"));
+                header.push(format!("Brandstof {slot} - {}", col.display));
             }
         }
-        header.push("export_status".to_string());
+        header.push(EXPORT_STATUS_HEADER.to_string());
         header
     }
 
@@ -47,13 +61,13 @@ impl RowWidener {
     pub fn widen(&self, row: &WidenedRow) -> Vec<String> {
         let mut out = Vec::with_capacity(self.header().len());
         for col in &self.vehicle_columns {
-            out.push(field_as_string(row.vehicle.0.get(col)));
+            out.push(field_as_string(row.vehicle.0.get(&col.field)));
         }
         for slot in 0..MAX_FUEL_ENTRIES {
             let fuel = row.fuels.get(slot);
             for col in &self.fuel_columns {
                 match fuel {
-                    Some(f) => out.push(field_as_string(f.0.get(col))),
+                    Some(f) => out.push(field_as_string(f.0.get(&col.field))),
                     None => out.push(String::new()),
                 }
             }
@@ -80,11 +94,14 @@ mod tests {
 
     fn widener() -> RowWidener {
         RowWidener::new(
-            vec!["kenteken".to_string(), "merk".to_string()],
             vec![
-                "kenteken".to_string(),
-                "brandstof_volgnummer".to_string(),
-                "brandstof_omschrijving".to_string(),
+                Column::new("kenteken", "Kenteken"),
+                Column::new("merk", "Merk"),
+            ],
+            vec![
+                Column::new("kenteken", "Kenteken"),
+                Column::new("brandstof_volgnummer", "Brandstof volgnummer"),
+                Column::new("brandstof_omschrijving", "Brandstof omschrijving"),
             ],
         )
     }
@@ -95,15 +112,15 @@ mod tests {
         assert_eq!(
             header,
             vec![
-                "kenteken",
-                "merk",
-                "fuel1_brandstof_volgnummer",
-                "fuel1_brandstof_omschrijving",
-                "fuel2_brandstof_volgnummer",
-                "fuel2_brandstof_omschrijving",
-                "fuel3_brandstof_volgnummer",
-                "fuel3_brandstof_omschrijving",
-                "export_status",
+                "Kenteken",
+                "Merk",
+                "Brandstof 1 - Brandstof volgnummer",
+                "Brandstof 1 - Brandstof omschrijving",
+                "Brandstof 2 - Brandstof volgnummer",
+                "Brandstof 2 - Brandstof omschrijving",
+                "Brandstof 3 - Brandstof volgnummer",
+                "Brandstof 3 - Brandstof omschrijving",
+                "Export status",
             ]
         );
     }
@@ -172,7 +189,7 @@ mod tests {
         let row = widener().widen(&widened[0]);
         let header = widener().header();
         let status_index = header.len() - 1;
-        assert_eq!(header[status_index], "export_status");
+        assert_eq!(header[status_index], "Export status");
         assert_eq!(row[status_index], "ok");
         assert_eq!(row.len(), header.len());
     }
