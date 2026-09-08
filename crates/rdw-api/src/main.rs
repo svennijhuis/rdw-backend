@@ -22,9 +22,18 @@ async fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    let app_token = std::env::var("RDW_APP_TOKEN").ok();
-    if app_token.is_none() {
-        tracing::warn!("RDW_APP_TOKEN not set; requests will use Socrata's unauthenticated tier");
+    // Accepts either credential the RDW portal issues: an App Token
+    // (X-App-Token) or an API Key / "API Sleutel" (key id + secret, HTTP
+    // Basic). Putting a key secret in RDW_APP_TOKEN fails upstream with
+    // "Invalid app_token specified", so both are supported explicitly.
+    let credentials = rdw_client::RdwCredentials::from_env();
+    match credentials {
+        rdw_client::RdwCredentials::None => tracing::warn!(
+            "no RDW credential set (RDW_API_KEY_ID + RDW_API_KEY_SECRET, or RDW_APP_TOKEN); \
+             requests will use Socrata's unauthenticated tier"
+        ),
+        // describe() names the mechanism only; a credential is never logged.
+        ref c => tracing::info!(credential = c.describe(), "RDW credential configured"),
     }
 
     let valid_api_keys: HashSet<String> = std::env::var("VALID_API_KEYS")
@@ -45,7 +54,7 @@ async fn main() {
     // require a code change.
     let fuel_kenteken_batch = env_usize("FUEL_KENTEKEN_BATCH", rdw_client::FUEL_KENTEKEN_BATCH);
 
-    let client = RdwClient::new(app_token)
+    let client = RdwClient::with_credentials(credentials)
         .with_fuel_concurrency(fuel_concurrency)
         .with_fuel_kenteken_batch(fuel_kenteken_batch);
     let metadata = load_column_metadata(&client).await;

@@ -114,13 +114,84 @@ fn is_retryable_status(status: u16) -> bool {
     status == 429 || (500..600).contains(&status)
 }
 
+/// How this client authenticates to opendata.rdw.nl.
+///
+/// The portal issues TWO different, non-interchangeable credentials, and
+/// putting one where the other belongs fails with a confusing
+/// `permission_denied` / "Invalid app_token specified":
+///
+/// * an **App Token**, sent in the `X-App-Token` header; and
+/// * an **API Key** ("API Sleutel": a key id plus a key secret), which is
+///   HTTP Basic auth, with the id as the username and the secret as the
+///   password.
+///
+/// Both are supported so whichever the portal offers is usable. Neither is
+/// required: unauthenticated requests work, just on a lower throttle tier.
+#[derive(Clone)]
+pub enum RdwCredentials {
+    /// No credential. Socrata's unauthenticated tier.
+    None,
+    /// An App Token, sent as `X-App-Token`.
+    AppToken(String),
+    /// An API Key: key id + key secret, sent as HTTP Basic auth.
+    ApiKey { id: String, secret: String },
+}
+
+impl RdwCredentials {
+    /// Read credentials from the environment. An API key takes precedence
+    /// over an app token when both are present, since it is the newer
+    /// mechanism and carries the higher rate limit. Values are never logged.
+    pub fn from_env() -> Self {
+        let id = std::env::var("RDW_API_KEY_ID")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let secret = std::env::var("RDW_API_KEY_SECRET")
+            .ok()
+            .filter(|v| !v.is_empty());
+        if let (Some(id), Some(secret)) = (id, secret) {
+            return Self::ApiKey { id, secret };
+        }
+        match std::env::var("RDW_APP_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(token) => Self::AppToken(token),
+            None => Self::None,
+        }
+    }
+
+    fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::None => req,
+            Self::AppToken(token) => req.header("X-App-Token", token),
+            Self::ApiKey { id, secret } => req.basic_auth(id, Some(secret)),
+        }
+    }
+
+    /// A description safe to log: names the mechanism, never the value.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::None => "unauthenticated (no RDW credential set)",
+            Self::AppToken(_) => "app token (X-App-Token)",
+            Self::ApiKey { .. } => "API key (HTTP Basic)",
+        }
+    }
+}
+
+/// Never let a credential reach a log or an error message through Debug.
+impl std::fmt::Debug for RdwCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.describe())
+    }
+}
+
 /// Thin wrapper around `reqwest::Client` configured for RDW: a fixed
 /// timeout and an optional `X-App-Token` header taken from the server-side
 /// `RDW_APP_TOKEN` environment variable. Absent token is allowed.
 #[derive(Clone)]
 pub struct RdwClient {
     http: reqwest::Client,
-    app_token: Option<String>,
+    credentials: RdwCredentials,
     resource_base: String,
     metadata_base: String,
     retry_config: RetryConfig,
@@ -184,7 +255,17 @@ const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 512;
 
 impl RdwClient {
+    /// Build a client from an app token, keeping the previous constructor's
+    /// shape. `None` means unauthenticated.
     pub fn new(app_token: Option<String>) -> Self {
+        Self::with_credentials(match app_token {
+            Some(t) => RdwCredentials::AppToken(t),
+            None => RdwCredentials::None,
+        })
+    }
+
+    /// Build a client from any supported credential.
+    pub fn with_credentials(credentials: RdwCredentials) -> Self {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             // Explicit even though the `gzip` feature enables this by
@@ -196,7 +277,7 @@ impl RdwClient {
             .expect("reqwest client with static config must build");
         Self {
             http,
-            app_token,
+            credentials,
             resource_base: SOCRATA_BASE.to_string(),
             metadata_base: DEFAULT_METADATA_BASE.to_string(),
             retry_config: RetryConfig::default(),
@@ -576,10 +657,7 @@ impl RdwClient {
     /// decoder rejecting a truncated compressed stream (bad CRC/ISIZE) — is
     /// `ClientError::Transport`, which `is_retryable` treats as retryable.
     async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ClientError> {
-        let mut req = self.http.get(url);
-        if let Some(token) = &self.app_token {
-            req = req.header("X-App-Token", token);
-        }
+        let req = self.credentials.apply(self.http.get(url));
         let resp = req.send().await.map_err(|e| {
             if e.is_timeout() {
                 ClientError::Timeout
@@ -628,10 +706,7 @@ impl RdwClient {
     }
 
     async fn get(&self, url: &str) -> Result<String, ClientError> {
-        let mut req = self.http.get(url);
-        if let Some(token) = &self.app_token {
-            req = req.header("X-App-Token", token);
-        }
+        let req = self.credentials.apply(self.http.get(url));
         let resp = req.send().await.map_err(|e| {
             if e.is_timeout() {
                 ClientError::Timeout
@@ -715,6 +790,80 @@ mod tests {
             initial_backoff: Duration::from_millis(0),
             max_backoff: Duration::from_millis(0),
         })
+    }
+
+    /// The credential must never be printable. A Debug leak here would put an
+    /// app token or a key secret into any log line or error that formats the
+    /// client.
+    #[test]
+    fn failure_credentials_never_render_their_value_via_debug() {
+        let token = RdwCredentials::AppToken("super-secret-token".to_string());
+        let key = RdwCredentials::ApiKey {
+            id: "key-id-value".to_string(),
+            secret: "key-secret-value".to_string(),
+        };
+        for cred in [&token, &key] {
+            let rendered = format!("{cred:?}");
+            assert!(!rendered.contains("super-secret-token"), "got: {rendered}");
+            assert!(!rendered.contains("key-secret-value"), "got: {rendered}");
+            assert!(!rendered.contains("key-id-value"), "got: {rendered}");
+        }
+        assert_eq!(format!("{token:?}"), "app token (X-App-Token)");
+        assert_eq!(format!("{key:?}"), "API key (HTTP Basic)");
+    }
+
+    /// An app token goes in X-App-Token and must NOT become Basic auth.
+    #[tokio::test]
+    async fn happy_path_app_token_is_sent_as_the_x_app_token_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .and(wiremock::matchers::header("x-app-token", "tok-123"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("kenteken,merk\nAA001A,TOYOTA\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RdwClient::with_credentials(RdwCredentials::AppToken("tok-123".to_string()))
+            .with_resource_base(format!("{}/resource", server.uri()));
+        let rows = client
+            .fetch_vehicle_page(&["TOYOTA".to_string()], None, 10)
+            .await
+            .expect("the app token must be sent as X-App-Token");
+        assert_eq!(rows.len(), 1);
+    }
+
+    /// An API key ("API Sleutel": id + secret) is HTTP Basic auth, NOT
+    /// X-App-Token. Sending the secret as an app token is what produces
+    /// RDW's "Invalid app_token specified" 403.
+    #[tokio::test]
+    async fn happy_path_api_key_is_sent_as_http_basic_auth_not_an_app_token() {
+        let server = MockServer::start().await;
+        // base64("key-id:key-secret")
+        let expected = format!("Basic {}", "a2V5LWlkOmtleS1zZWNyZXQ=");
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .and(wiremock::matchers::header(
+                "authorization",
+                expected.as_str(),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("kenteken,merk\nAA001A,TOYOTA\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = RdwClient::with_credentials(RdwCredentials::ApiKey {
+            id: "key-id".to_string(),
+            secret: "key-secret".to_string(),
+        })
+        .with_resource_base(format!("{}/resource", server.uri()));
+        let rows = client
+            .fetch_vehicle_page(&["TOYOTA".to_string()], None, 10)
+            .await
+            .expect("the API key must be sent as HTTP Basic auth");
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
