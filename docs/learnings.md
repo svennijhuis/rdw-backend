@@ -104,3 +104,32 @@
 - Session rate limits killed the correctness and security reviewers mid-run, twice.
   As in the previous run, doing the high-risk checks directly in the main agent was
   cheaper and worked. Budget for reviewers dying and have a fallback.
+
+### Security pass on the CSV parser (same run, later)
+
+- The `csv` crate treats end-of-input INSIDE A QUOTED FIELD as a valid end of
+  that field. A body cut mid-quoted-cell therefore parses perfectly cleanly into
+  a short page, and both pipelines read a short page as "this range is
+  exhausted". Criterion B.4 was written to prevent exactly this and the
+  implementation did not actually achieve it: the guard was assumed to come from
+  gzip's CRC, which only helps when the response is gzipped. Fixed with a framing
+  check — every Socrata CSV body ends with a newline (verified live on the
+  vehicle dataset, the fuel dataset, and a header-only zero-row response), so a
+  body that does not is incomplete whatever the parser makes of it.
+  GENERAL LESSON: a lenient parser is not a truncation detector. Check framing
+  explicitly against a property the real endpoint actually guarantees.
+- `headers.iter().enumerate().map(|(i,h)| (h,i)).collect::<HashMap<_,_>>()` keeps
+  the LAST duplicate. A header of `kenteken,merk,kenteken` passed the
+  required-column check and then read the join key from the wrong column. Now
+  rejected. Collecting into a map silently resolves duplicates — never do it for
+  a key that a join depends on.
+- Enabling gzip added a decompression-bomb surface that did not exist before:
+  `resp.bytes()` buffers the DECOMPRESSED body, whose size nothing in the
+  response declares, so a Content-Length check would not have helped. Now read in
+  chunks against a 256 MB budget. Worth remembering that turning on transparent
+  decompression is a security change, not only a performance one.
+- The upstream error body was echoed to the API caller unbounded, inside the 502
+  message. Now truncated to 512 bytes on a char boundary.
+- `neutralize_formula` was checked and is still applied to every cell on the new
+  path; the parser deliberately passes payloads through untouched and a test now
+  pins that contract so neither layer starts assuming the other sanitizes.

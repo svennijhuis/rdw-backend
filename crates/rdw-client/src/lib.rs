@@ -166,6 +166,23 @@ const _: () = assert!(
 /// `FUEL_CONCURRENCY`.
 pub const DEFAULT_FUEL_CONCURRENCY: usize = 16;
 
+/// Hard ceiling on a single decompressed response body.
+///
+/// Enabling reqwest's `gzip` feature made transparent decompression a new
+/// attack surface: a small compressed body can expand without bound, and
+/// `resp.bytes()` would happily buffer all of it. The largest legitimate
+/// response is one vehicle page, which at the 50,000-row Socrata cap measures
+/// about 40 MB of CSV, so 256 MB leaves a very wide margin while still
+/// bounding the damage a malformed or hostile response can do to a container
+/// that also has an export staged in memory.
+const MAX_RESPONSE_BYTES: usize = 256 * 1024 * 1024;
+
+/// How much of an upstream error body is kept. The body is surfaced in
+/// `ClientError::Http`, which reaches the API caller inside a 502 message, so
+/// an unbounded upstream error page would be both an unbounded allocation and
+/// a needlessly large disclosure of upstream internals.
+const MAX_ERROR_BODY_BYTES: usize = 512;
+
 impl RdwClient {
     pub fn new(app_token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
@@ -572,16 +589,42 @@ impl RdwClient {
         })?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let mut body = resp.text().await.unwrap_or_default();
+            // Truncate on a char boundary: this string is echoed into a 502.
+            if body.len() > MAX_ERROR_BODY_BYTES {
+                let mut end = MAX_ERROR_BODY_BYTES;
+                while end > 0 && !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.truncate(end);
+                body.push_str("… (truncated)");
+            }
             return Err(ClientError::Http {
                 status: status.as_u16(),
                 body,
             });
         }
-        resp.bytes()
-            .await
-            .map(|b| b.to_vec())
-            .map_err(|e| ClientError::Transport(e.to_string()))
+
+        // Read the body in chunks against a byte budget rather than calling
+        // `resp.bytes()`, which buffers whatever arrives. With gzip enabled the
+        // decompressed size is not bounded by anything the response declares,
+        // so a `Content-Length` check would not help.
+        let mut out: Vec<u8> = Vec::new();
+        let mut resp = resp;
+        loop {
+            let chunk = resp
+                .chunk()
+                .await
+                .map_err(|e| ClientError::Transport(e.to_string()))?;
+            let Some(chunk) = chunk else { break };
+            if out.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(ClientError::Decode(format!(
+                    "RDW response exceeded the {MAX_RESPONSE_BYTES}-byte ceiling"
+                )));
+            }
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
     }
 
     async fn get(&self, url: &str) -> Result<String, ClientError> {
@@ -1214,6 +1257,59 @@ mod tests {
             .await
             .expect_err("a persistent 500 on the count query must not be swallowed");
         assert!(matches!(err, ClientError::RetriesExhausted { .. }));
+    }
+
+    /// An upstream error body reaches the API caller inside a 502 message, so
+    /// it must not be echoed back without bound.
+    #[tokio::test]
+    async fn failure_oversized_upstream_error_body_is_truncated_before_it_is_surfaced() {
+        let server = MockServer::start().await;
+        let huge = "E".repeat(50_000);
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .respond_with(ResponseTemplate::new(500).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let err = client
+            .fetch_vehicle_page(&["TOYOTA".to_string()], None, 10)
+            .await
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.len() < 2_000,
+            "an upstream error body must be truncated before it is surfaced, got {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.contains("truncated"), "got: {rendered}");
+    }
+
+    /// A response body without a trailing newline is a truncated body, and the
+    /// client must surface that rather than handing a short page upwards.
+    #[tokio::test]
+    async fn failure_truncated_response_body_never_becomes_a_short_page() {
+        let server = MockServer::start().await;
+        // Two complete records, then a cut before the final newline.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("kenteken,merk\nAA001A,TOYOTA\nBB002B,TOYOTA"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let err = client
+            .fetch_vehicle_page(&["TOYOTA".to_string()], None, 50_000)
+            .await
+            .expect_err("a truncated body must not parse into a short page");
+        // Retried first (truncation is usually transient), then surfaced.
+        assert!(
+            matches!(err, ClientError::RetriesExhausted { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[tokio::test]
