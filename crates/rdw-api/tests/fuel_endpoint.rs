@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use rdw_api::pipeline::ConcurrentConfig;
 use rdw_api::state::AppState;
 use rdw_client::{RdwClient, RetryConfig};
 use rdw_core::{Column, ColumnMetadata, FailureConfig};
@@ -60,7 +61,21 @@ async fn build_app_with_failure_config(
     let mut valid_keys = HashSet::new();
     valid_keys.insert(API_KEY.to_string());
     let state = Arc::new(
-        AppState::new(client, test_metadata(), valid_keys).with_failure_config(failure_config),
+        AppState::new(client, test_metadata(), valid_keys)
+            .with_failure_config(failure_config)
+            // A single range (rather than the production default of 64)
+            // keeps wiremock's "any query gets the same fixture" behaviour
+            // from replicating a mounted vehicle page across every range,
+            // so the up-front `$select=count(kenteken)` mock (see
+            // `mount_vehicle_count`) can name an exact, predictable expected
+            // row count for the V.1 reconciliation. Scope C's own
+            // multi-range behaviour is covered separately in
+            // `pipeline::concurrent_tests`.
+            .with_concurrent_config(ConcurrentConfig {
+                range_count: 1,
+                worker_count: 1,
+                page_size: 50_000,
+            }),
     );
     let app = rdw_api::build_router(state.clone()).layer(
         axum::extract::connect_info::MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 0))),
@@ -73,24 +88,78 @@ async fn build_app_with_failure_config(
 /// failure.
 async fn mount_fuel_range_failing(server: &MockServer) {
     Mock::given(method("GET"))
-        .and(path("/resource/8ys7-d773.json"))
+        .and(path("/resource/8ys7-d773.csv"))
         .respond_with(ResponseTemplate::new(500))
         .mount(server)
         .await;
 }
 
+/// Build a CSV response body from a JSON array of objects, using `header` as
+/// both the column order and the set of fields read from each object. Lets
+/// call sites keep writing `json!([{ ... }])` fixtures while the wire format
+/// underneath is Socrata's CSV, not JSON.
+fn csv_body(header: &[&str], rows: &serde_json::Value) -> String {
+    let mut body = header.join(",");
+    body.push('\n');
+    for row in rows.as_array().cloned().unwrap_or_default() {
+        let obj = row.as_object().cloned().unwrap_or_default();
+        let cells: Vec<String> = header
+            .iter()
+            .map(|h| {
+                obj.get(*h)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        body.push_str(&cells.join(","));
+        body.push('\n');
+    }
+    body
+}
+
 async fn mount_vehicle_page(server: &MockServer, vehicles: serde_json::Value) {
+    // The up-front `$select=count(kenteken)` reconciliation query (V.1) is
+    // issued once before any vehicle page is fetched, so every test that
+    // mounts a vehicle page must also mount a matching count — otherwise the
+    // export would fail before ever reaching the page fetch this function
+    // sets up. The count matches this fixture's own row count exactly,
+    // since `build_app_with_failure_config` pins `range_count: 1`.
+    let expected_count = vehicles.as_array().map(|a| a.len()).unwrap_or(0) as u64;
+    mount_vehicle_count(server, expected_count).await;
     Mock::given(method("GET"))
-        .and(path("/resource/m9d7-ebf2.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(vehicles))
+        .and(path("/resource/m9d7-ebf2.csv"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(csv_body(&["kenteken", "merk"], &vehicles)),
+        )
+        .mount(server)
+        .await;
+}
+
+/// Mount the `$select=count(kenteken)` aggregate query (criterion V.1),
+/// matched by query param since it shares the vehicle dataset's path with
+/// the paged fetch `mount_vehicle_page` sets up.
+async fn mount_vehicle_count(server: &MockServer, count: u64) {
+    Mock::given(method("GET"))
+        .and(path("/resource/m9d7-ebf2.csv"))
+        .and(wiremock::matchers::query_param(
+            "$select",
+            "count(kenteken)",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("count_kenteken\n{count}\n")),
+        )
         .mount(server)
         .await;
 }
 
 async fn mount_fuel_range(server: &MockServer, fuel: serde_json::Value) {
     Mock::given(method("GET"))
-        .and(path("/resource/8ys7-d773.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(fuel))
+        .and(path("/resource/8ys7-d773.csv"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(csv_body(
+            &["kenteken", "brandstof_volgnummer", "brandstof_omschrijving"],
+            &fuel,
+        )))
         .mount(server)
         .await;
 }
@@ -261,7 +330,7 @@ async fn failure_fourth_fuel_entry_causes_502_and_sends_no_csv() {
 async fn failure_vehicle_page_failure_returns_502_not_partial_csv() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/resource/m9d7-ebf2.json"))
+        .and(path("/resource/m9d7-ebf2.csv"))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -428,10 +497,16 @@ async fn response_header_x_export_warnings_counts_failures() {
         },
     )
     .await;
+    // A `limit` keeps this on the sequential single-range path (Scope C's
+    // concurrent ranges are only used for unlimited exports), so the two
+    // vehicles are fetched, and their fuel fetched, as exactly one range —
+    // matching this test's "one failed range" assertion below.
     let response = app
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/fuel?brands=toyota&api_key={API_KEY}"))
+                .uri(format!(
+                    "/api/v1/fuel?brands=toyota&limit=1000&api_key={API_KEY}"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -676,11 +751,15 @@ async fn failure_second_concurrent_export_returns_429_while_first_is_in_flight()
     // when the second request arrives; we poll the semaphore's permit
     // count (rather than sleep-and-hope) so the assertion is deterministic.
     let server = MockServer::start().await;
+    // Matched by query param, so it does not compete with the delayed
+    // empty-page mock below: the up-front V.1 count query must resolve
+    // (with a matching empty count) before this delay would otherwise apply.
+    mount_vehicle_count(&server, 0).await;
     Mock::given(method("GET"))
-        .and(path("/resource/m9d7-ebf2.json"))
+        .and(path("/resource/m9d7-ebf2.csv"))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_json(json!([]))
+                .set_body_string(csv_body(&["kenteken", "merk"], &json!([])))
                 .set_delay(std::time::Duration::from_millis(200)),
         )
         .mount(&server)

@@ -69,7 +69,41 @@ Dockerfile, so no local artifact needs uploading.
 
 ### Size limit on Vercel
 
-Vercel Functions cap a non-streamed response body at roughly 4.5MB. Measured against this service,
-**about 5,000 rows produces 4.2MB**, so that is the practical ceiling there; larger exports fail.
-Local or self-hosted Docker has no such cap and is the supported path for a full, unrestricted
-export.
+`vercel.json` runs this service under Vercel's **container** runtime (see the Vercel section above),
+not the Vercel Functions runtime, so the historical ~4.5MB non-streamed response-body cap does not
+apply here. The response is streamed either way. Vercel's platform-level request timeout and
+container restart/cold-start behavior still apply, though, and a full unrestricted export (gzip +
+CSV brings a full Toyota export from ~2.6GB to roughly ~130MB, but it is still a large,
+multi-minute request) is more reliably run against local or self-hosted Docker, which has neither a
+request-size nor a duration limit.
+
+### `curl --compressed` is required for large exports
+
+A response above `UNCOMPRESSED_SIZE_THRESHOLD_MB` (default 50MB staged/compressed size) is refused
+with `406 Not Acceptable` for any client that does not send `Accept-Encoding: gzip`, rather than
+decompressing a potentially multi-hundred-MB body server-side for a client that could simply have
+asked for gzip. Every mainstream browser sends this header automatically, so a plain
+address-bar download is unaffected; a bare `curl` needs `--compressed`:
+
+```bash
+curl --compressed -v -o fuel-export.csv \
+  "http://localhost:3000/api/v1/fuel?brands=toyota&api_key=test-key-123"
+```
+
+### Row order is non-deterministic for unlimited exports
+
+An export with no `limit` is fetched via many concurrent, unordered kenteken ranges (see
+`docs/ARCHITECTURE.md`) for wall-time, rather than the single sequential kenteken-ascending cursor a
+`?limit=` request still uses. Row order in the output CSV/ZIP is therefore not guaranteed
+kenteken-ascending for an unlimited export, and can differ between runs of the same request.
+
+### Rate-limit quota requires session affinity across containers
+
+The per-API-key/per-brand rate limiter (`FUEL_FAILURE_FLOOR`/`FUEL_FAILURE_RATIO` aside — this is the
+daily/weekly request quota) and the single-export concurrency guard are both **per-process, in-memory
+state**. Running more than one container behind a load balancer means each container tracks its own
+independent quota and its own independent "an export is in progress" flag: a client whose requests
+are spread across containers can exceed its intended quota, and two containers can each believe they
+are the only export in flight. Fixed-IP or session affinity at the load balancer is required for the
+quota and the single-export guard to behave as documented; this is a known, accepted limitation
+(see `docs/plans/rdw-fuel-export-perf-cost.md`), not a bug fixed by this deployment guide.

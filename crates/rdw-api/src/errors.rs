@@ -11,10 +11,17 @@ use axum::response::{IntoResponse, Response};
 pub enum ApiError {
     BadRequest(String),
     Unauthorized,
-    RateLimited { retry_after_secs: u64 },
+    RateLimited {
+        retry_after_secs: u64,
+    },
     Busy,
     BadGateway(String),
     GatewayTimeout(String),
+    /// The staged export is uncompressed-too-large for a client that did not
+    /// send `Accept-Encoding: gzip`. Always rendered as plain text (see
+    /// `render`), regardless of the request's `Accept` header, so a bare
+    /// `curl` or script always gets an actionable, machine-parseable message.
+    NotAcceptable(String),
 }
 
 impl ApiError {
@@ -25,6 +32,7 @@ impl ApiError {
             ApiError::RateLimited { .. } | ApiError::Busy => StatusCode::TOO_MANY_REQUESTS,
             ApiError::BadGateway(_) => StatusCode::BAD_GATEWAY,
             ApiError::GatewayTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            ApiError::NotAcceptable(_) => StatusCode::NOT_ACCEPTABLE,
         }
     }
 
@@ -38,6 +46,7 @@ impl ApiError {
             }
             ApiError::BadGateway(msg) => format!("Upstream RDW error: {msg}"),
             ApiError::GatewayTimeout(msg) => format!("Upstream RDW timeout: {msg}"),
+            ApiError::NotAcceptable(msg) => msg.clone(),
         }
     }
 
@@ -83,6 +92,20 @@ pub fn render(err: &ApiError, accept: Option<&str>) -> RenderedError {
     let status = err.status();
     let message = err.message();
     let retry_after_secs = err.retry_after_secs();
+
+    // A 406 must always be plain text with a copy-pasteable retry command,
+    // even when the request's Accept header prefers HTML: a bare `curl`
+    // (the exact client this error targets) never sends `Accept: text/html`,
+    // but a browser navigating directly to the URL might, and an HTML page
+    // here would hide the actionable message this error exists to deliver.
+    if matches!(err, ApiError::NotAcceptable(_)) {
+        return RenderedError {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body: message,
+            retry_after_secs,
+        };
+    }
 
     if prefers_html(accept) {
         let body = format!(
@@ -183,6 +206,31 @@ mod tests {
             None,
         );
         assert_eq!(rendered.retry_after_secs, Some(42));
+    }
+
+    #[test]
+    fn happy_path_not_acceptable_is_406_with_actionable_plain_text() {
+        let rendered = render(
+            &ApiError::NotAcceptable(
+                "Staged data exceeds 50 MB; please retry with Accept-Encoding: gzip".to_string(),
+            ),
+            None,
+        );
+        assert_eq!(rendered.status, StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(rendered.content_type, "text/plain; charset=utf-8");
+        assert!(rendered.body.contains("Accept-Encoding: gzip"));
+    }
+
+    #[test]
+    fn edge_not_acceptable_stays_plain_text_even_when_html_is_preferred() {
+        // The message must remain copy-pasteable for a CLI tool even if a
+        // browser (which sends `Accept: text/html`) is the one that hits it.
+        let rendered = render(
+            &ApiError::NotAcceptable("please retry with Accept-Encoding: gzip".to_string()),
+            Some("text/html"),
+        );
+        assert_eq!(rendered.content_type, "text/plain; charset=utf-8");
+        assert!(!rendered.body.starts_with("<!DOCTYPE"));
     }
 
     #[test]

@@ -7,6 +7,8 @@
 
 use std::time::Duration;
 
+mod csv_parse;
+
 use rand::Rng;
 use serde_json::{Map, Value};
 
@@ -95,6 +97,14 @@ impl ClientError {
         match self {
             ClientError::Timeout => true,
             ClientError::Http { status, .. } => is_retryable_status(*status),
+            // A body-read/decode failure while streaming or ungzipping the
+            // response — including a CSV record that fails to parse because
+            // the body was cut off mid-record — must be retried rather than
+            // silently treated as a short-but-complete page. Before this,
+            // these landed in `Transport` and were NOT retried, which is
+            // exactly the truncated-body-becomes-a-silent-short-page bug
+            // this client must never repeat.
+            ClientError::Transport(_) => true,
             _ => false,
         }
     }
@@ -116,6 +126,7 @@ pub struct RdwClient {
     retry_config: RetryConfig,
     fuel_page_limit: u32,
     fuel_concurrency: usize,
+    fuel_kenteken_batch: usize,
 }
 
 const DEFAULT_METADATA_BASE: &str = "https://opendata.rdw.nl/api/views";
@@ -126,6 +137,21 @@ const DEFAULT_METADATA_BASE: &str = "https://opendata.rdw.nl/api/views";
 /// in about 0.4s, while 2,000 is rejected with HTTP 414 Request-URI Too Large.
 /// 800 keeps clear headroom under that ceiling.
 pub const FUEL_KENTEKEN_BATCH: usize = 800;
+
+/// This crate cannot depend on `rdw-core` (which depends on this crate), so
+/// `rdw_core::merge::MAX_FUEL_ENTRIES` (currently 3) is duplicated here only
+/// for this compile-time sanity check. If that constant ever changes, this
+/// assertion (and the one below) must be updated to match.
+const ASSUMED_MAX_FUEL_ENTRIES_PER_VEHICLE: usize = 3;
+
+// A batch's worst-case fuel row count (every plate at the maximum fuel
+// entries) must stay comfortably under `DEFAULT_FUEL_PAGE_LIMIT`, or a
+// single kenteken batch could legitimately hit the page's `$limit` and the
+// runtime check in `fetch_fuel_for_kentekens` would reject a correct
+// response as a false-positive truncation.
+const _: () = assert!(
+    FUEL_KENTEKEN_BATCH * ASSUMED_MAX_FUEL_ENTRIES_PER_VEHICLE < DEFAULT_FUEL_PAGE_LIMIT as usize
+);
 
 /// How many fuel batches are in flight at once.
 ///
@@ -144,6 +170,11 @@ impl RdwClient {
     pub fn new(app_token: Option<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
+            // Explicit even though the `gzip` feature enables this by
+            // default: a future `default-features = false` on reqwest must
+            // not silently turn off transparent response decompression,
+            // which is the primary cost lever of this client.
+            .gzip(true)
             .build()
             .expect("reqwest client with static config must build");
         Self {
@@ -154,6 +185,7 @@ impl RdwClient {
             retry_config: RetryConfig::default(),
             fuel_page_limit: DEFAULT_FUEL_PAGE_LIMIT,
             fuel_concurrency: DEFAULT_FUEL_CONCURRENCY,
+            fuel_kenteken_batch: FUEL_KENTEKEN_BATCH,
         }
     }
 
@@ -194,6 +226,17 @@ impl RdwClient {
         self
     }
 
+    /// Override how many kentekens go into one fuel query. Production
+    /// defaults to `FUEL_KENTEKEN_BATCH`; overridable via the
+    /// `FUEL_KENTEKEN_BATCH` environment variable (read by the `rdw-api`
+    /// binary at startup) so re-tuning never requires a code change. A
+    /// value of 0 is treated as 1 for the same reason as
+    /// `with_fuel_concurrency`.
+    pub fn with_fuel_kenteken_batch(mut self, batch: usize) -> Self {
+        self.fuel_kenteken_batch = batch.max(1);
+        self
+    }
+
     /// Build the SODA URL for one keyset page of vehicles, filtered by an
     /// allow-listed set of `merk` values and, when present, a `kenteken`
     /// cursor from the previous page's last row.
@@ -213,10 +256,111 @@ impl RdwClient {
             where_clause.push_str(&format!(" AND kenteken > '{}'", escape_soql(after)));
         }
         format!(
-            "{}/{VEHICLE_DATASET_ID}.json?$where={}&$order=kenteken&$limit={limit}",
+            "{}/{VEHICLE_DATASET_ID}.csv?$where={}&$order=kenteken&$limit={limit}",
             self.resource_base,
             urlencoding_soql(&where_clause)
         )
+    }
+
+    /// Build the SODA URL for one keyset page of vehicles constrained to a
+    /// kenteken RANGE (Scope C, concurrent range fetching): `kenteken >
+    /// range_lo AND kenteken <= range_hi`. `range_lo`/`range_hi` are the
+    /// range's own fixed boundaries (`None` = unbounded on that side, for
+    /// the first/last range); `cursor` narrows the lower bound further as
+    /// pages within the range advance, exactly like `after_kenteken` in
+    /// `vehicle_page_url`. The range boundary is expressed SOLELY in this
+    /// `$where` clause — Socrata evaluates it, never the client.
+    pub fn vehicle_range_page_url(
+        &self,
+        merken: &[String],
+        range_lo: Option<&str>,
+        range_hi: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> String {
+        let merk_list = merken
+            .iter()
+            .map(|m| format!("'{}'", escape_soql(m)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut where_clause = format!("merk in({merk_list})");
+        // The cursor only ever narrows forward from the range's own lower
+        // bound, so once a cursor exists it is strictly the tighter bound.
+        if let Some(lo) = cursor.or(range_lo) {
+            where_clause.push_str(&format!(" AND kenteken > '{}'", escape_soql(lo)));
+        }
+        if let Some(hi) = range_hi {
+            where_clause.push_str(&format!(" AND kenteken <= '{}'", escape_soql(hi)));
+        }
+        format!(
+            "{}/{VEHICLE_DATASET_ID}.csv?$where={}&$order=kenteken&$limit={limit}",
+            self.resource_base,
+            urlencoding_soql(&where_clause)
+        )
+    }
+
+    /// Build the SODA URL for the total row count of the SAME population one
+    /// `vehicle_page_url`/`vehicle_range_page_url` call would page through
+    /// (`merk in(...)`, no cursor/range narrowing). Used once per export, up
+    /// front, so the end-to-end row-count reconciliation (criterion V.1)
+    /// compares against a real aggregate rather than an assumed one.
+    pub fn vehicle_count_url(&self, merken: &[String]) -> String {
+        let merk_list = merken
+            .iter()
+            .map(|m| format!("'{}'", escape_soql(m)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let where_clause = format!("merk in({merk_list})");
+        format!(
+            "{}/{VEHICLE_DATASET_ID}.csv?$select=count(kenteken)&$where={}",
+            self.resource_base,
+            urlencoding_soql(&where_clause)
+        )
+    }
+
+    /// Column a vehicle-count CSV response's header must contain. Socrata
+    /// names a `count(x)` aggregate column `count_x`.
+    const VEHICLE_COUNT_REQUIRED_COLUMNS: &'static [&'static str] = &["count_kenteken"];
+
+    /// Fetch the total vehicle row count for `merken` — the same population
+    /// `fetch_and_widen_concurrent` pages through — used once, up front, as
+    /// the expected side of the end-to-end row-count reconciliation
+    /// (criterion V.1). Goes through the same retry path and CSV parser as
+    /// every other fetch, so an upstream failure here is reported exactly
+    /// like any other upstream failure, never silently skipped.
+    pub async fn fetch_vehicle_count(&self, merken: &[String]) -> Result<u64, ClientError> {
+        let url = self.vehicle_count_url(merken);
+        let rows = self
+            .get_csv_rows(&url, Self::VEHICLE_COUNT_REQUIRED_COLUMNS)
+            .await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| ClientError::Decode("count response returned no rows".to_string()))?;
+        let raw = row
+            .get("count_kenteken")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ClientError::Decode("count response missing count_kenteken column".to_string())
+            })?;
+        raw.parse::<u64>()
+            .map_err(|e| ClientError::Decode(format!("failed to parse vehicle count '{raw}': {e}")))
+    }
+
+    /// Fetch one keyset page of vehicles within a fixed kenteken range. See
+    /// `vehicle_range_page_url`.
+    pub async fn fetch_vehicle_range_page(
+        &self,
+        merken: &[String],
+        range_lo: Option<&str>,
+        range_hi: Option<&str>,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<VehicleRow>, ClientError> {
+        let url = self.vehicle_range_page_url(merken, range_lo, range_hi, cursor, limit);
+        let rows = self
+            .get_csv_rows(&url, Self::VEHICLE_REQUIRED_COLUMNS)
+            .await?;
+        Ok(rows.into_iter().map(VehicleRow).collect())
     }
 
     /// Build the SODA URL for one keyset page of the fuel rows covering a
@@ -243,14 +387,28 @@ impl RdwClient {
             .join(",");
         let where_clause = format!("kenteken in ({list})");
         format!(
-            "{}/{FUEL_DATASET_ID}.json?$where={}&$order=kenteken,brandstof_volgnummer&$limit={}",
+            "{}/{FUEL_DATASET_ID}.csv?$where={}&$order=kenteken,brandstof_volgnummer&$limit={}",
             self.resource_base,
             urlencoding_soql(&where_clause),
             self.fuel_page_limit
         )
     }
 
-    /// Fetch one keyset page of vehicles with retry-with-backoff.
+    /// Columns a vehicle CSV page's header must contain. Its absence means
+    /// the response is not a real vehicle page — most likely a Socrata error
+    /// page served with HTTP 200 — and must be rejected as an upstream error
+    /// before the empty-page check, or it silently becomes an empty export.
+    const VEHICLE_REQUIRED_COLUMNS: &'static [&'static str] = &["kenteken"];
+    /// Columns a fuel CSV page's header must contain; see
+    /// `VEHICLE_REQUIRED_COLUMNS`. `brandstof_volgnummer` is required too,
+    /// since `merge_join` cannot validate per-vehicle sequencing without it.
+    const FUEL_REQUIRED_COLUMNS: &'static [&'static str] = &["kenteken", "brandstof_volgnummer"];
+
+    /// Fetch one keyset page of vehicles with retry-with-backoff. Requests
+    /// and parses Socrata's CSV format rather than JSON: about 1.5x smaller
+    /// even before gzip, and every cell is read as a plain string (never
+    /// numeric/boolean-inferred), matching the JSON path's dynamic-object
+    /// shape via `parse_csv_rows`.
     pub async fn fetch_vehicle_page(
         &self,
         merken: &[String],
@@ -258,20 +416,20 @@ impl RdwClient {
         limit: u32,
     ) -> Result<Vec<VehicleRow>, ClientError> {
         let url = self.vehicle_page_url(merken, after_kenteken, limit);
-        let rows = self.get_json_array(&url).await?;
+        let rows = self
+            .get_csv_rows(&url, Self::VEHICLE_REQUIRED_COLUMNS)
+            .await?;
         Ok(rows.into_iter().map(VehicleRow).collect())
     }
 
-    /// Fetch every fuel row in a kenteken range, keyset-paginating past
-    /// Socrata's per-request row cap. A response at exactly the configured
-    /// page limit is treated as "there is more": the next page resumes from
-    /// the last row's `(kenteken, brandstof_volgnummer)` cursor, splitting
-    /// only between pages (never fabricating a boundary inside one
-    /// kenteken's volgnummer group, since the cursor always resumes at the
-    /// exact next row). Paging stops once a short page (fewer rows than the
-    /// limit) is returned. Each page fetch retries with backoff via
-    /// `get_json_array`; a page that exhausts its retries fails the whole
-    /// range fetch.
+    /// Fetch every fuel row for an explicit list of kentekens, in batches of
+    /// `fuel_kenteken_batch` names, fetched concurrently up to
+    /// `fuel_concurrency` at a time. Each batch is a single CSV page, not
+    /// itself paginated: the compile-time assertion on `FUEL_KENTEKEN_BATCH`
+    /// keeps a batch's worst-case row count (batch size * `MAX_FUEL_ENTRIES`)
+    /// well under `DEFAULT_FUEL_PAGE_LIMIT`, and a response landing exactly
+    /// on the configured `$limit` is treated as a truncation (more rows exist
+    /// than were returned) rather than silently accepted as complete.
     pub async fn fetch_fuel_for_kentekens(
         &self,
         kentekens: &[String],
@@ -287,18 +445,26 @@ impl RdwClient {
         // an unauthenticated caller is throttled harder, so firing hundreds of
         // requests at once buys 429s and retries instead of speed.
         let urls: Vec<String> = kentekens
-            .chunks(FUEL_KENTEKEN_BATCH)
+            .chunks(self.fuel_kenteken_batch)
             .map(|batch| self.fuel_by_kentekens_url(batch))
             .collect();
+        let page_limit = self.fuel_page_limit;
 
         let pages: Vec<Vec<FuelRow>> = futures::stream::iter(urls)
             .map(|url| async move {
-                let rows: Vec<FuelRow> = self
-                    .get_json_array(&url)
-                    .await?
-                    .into_iter()
-                    .map(FuelRow)
-                    .collect();
+                let raw_rows = self.get_csv_rows(&url, Self::FUEL_REQUIRED_COLUMNS).await?;
+                if raw_rows.len() as u32 == page_limit {
+                    // A batch is never paginated further, so a response
+                    // landing exactly on `$limit` means rows beyond it exist
+                    // and were silently cut off. The compile-time assertion
+                    // above keeps this from happening in normal operation;
+                    // this is the runtime backstop.
+                    return Err(ClientError::Decode(format!(
+                        "fuel page returned exactly the configured limit ({page_limit}) rows; \
+                         more rows may exist beyond it"
+                    )));
+                }
+                let rows: Vec<FuelRow> = raw_rows.into_iter().map(FuelRow).collect();
                 Ok::<_, ClientError>(rows)
             })
             .buffered(self.fuel_concurrency)
@@ -347,6 +513,28 @@ impl RdwClient {
             .collect()
     }
 
+    /// Fetch one CSV page with retry-with-backoff and parse it into row
+    /// maps. The CSV parse happens INSIDE the retried closure (not after
+    /// `with_retry` returns), so a body that read fine at the HTTP layer but
+    /// fails to parse as CSV (e.g. cut off mid-record, or a gzip stream cut
+    /// short and failing its CRC check on decode) is retried exactly like a
+    /// timeout or 5xx, rather than surfacing as a one-shot failure.
+    async fn get_csv_rows(
+        &self,
+        url: &str,
+        required_columns: &'static [&'static str],
+    ) -> Result<Vec<Map<String, Value>>, ClientError> {
+        with_retry(&self.retry_config, || async {
+            let bytes = self.get_bytes(url).await?;
+            csv_parse::parse_csv_rows(&bytes, required_columns)
+        })
+        .await
+    }
+
+    // Retained only for tests exercising the generic HTTP retry/timeout
+    // machinery against a plain JSON body; production fetches now go through
+    // `get_csv_rows`.
+    #[cfg(test)]
     async fn get_json_array(&self, url: &str) -> Result<Vec<Map<String, Value>>, ClientError> {
         let body = with_retry(&self.retry_config, || self.get(url)).await?;
         let value: Value =
@@ -362,6 +550,38 @@ impl RdwClient {
                 .collect(),
             _ => Err(ClientError::Decode("expected a JSON array".to_string())),
         }
+    }
+
+    /// Like `get`, but returns the raw response bytes rather than decoding
+    /// them as UTF-8 text, for callers (CSV parsing) that want to feed the
+    /// byte stream straight to a parser instead of splitting on '\n'
+    /// themselves. A read failure here — including reqwest's automatic gzip
+    /// decoder rejecting a truncated compressed stream (bad CRC/ISIZE) — is
+    /// `ClientError::Transport`, which `is_retryable` treats as retryable.
+    async fn get_bytes(&self, url: &str) -> Result<Vec<u8>, ClientError> {
+        let mut req = self.http.get(url);
+        if let Some(token) = &self.app_token {
+            req = req.header("X-App-Token", token);
+        }
+        let resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                ClientError::Timeout
+            } else {
+                ClientError::Transport(e.to_string())
+            }
+        })?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::Http {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        resp.bytes()
+            .await
+            .map(|b| b.to_vec())
+            .map_err(|e| ClientError::Transport(e.to_string()))
     }
 
     async fn get(&self, url: &str) -> Result<String, ClientError> {
@@ -475,6 +695,123 @@ mod tests {
         );
     }
 
+    // --- Scope C: kenteken-range vehicle queries ---
+
+    #[test]
+    fn happy_path_range_query_filters_both_lower_and_upper_bound() {
+        let url = RdwClient::new(None).vehicle_range_page_url(
+            &["TOYOTA".to_string()],
+            Some("0001VH"),
+            Some("5001VH"),
+            None,
+            3000,
+        );
+        assert!(url.contains("0001VH") && url.contains("5001VH"));
+        assert!(url.contains("kenteken+%3E") || url.contains("kenteken%20%3E"));
+        assert!(url.contains("kenteken+%3C%3D") || url.contains("kenteken%20%3C%3D"));
+    }
+
+    #[test]
+    fn edge_first_range_omits_lower_bound_when_unbounded() {
+        let url = RdwClient::new(None).vehicle_range_page_url(
+            &["TOYOTA".to_string()],
+            None,
+            Some("5001VH"),
+            None,
+            3000,
+        );
+        assert!(
+            !url.contains("kenteken+%3E") && !url.contains("kenteken%20%3E"),
+            "an unbounded-below range must not filter by a lower bound: {url}"
+        );
+        assert!(url.contains("5001VH"));
+    }
+
+    #[test]
+    fn edge_last_range_omits_upper_bound_when_unbounded() {
+        let url = RdwClient::new(None).vehicle_range_page_url(
+            &["TOYOTA".to_string()],
+            Some("5001VH"),
+            None,
+            None,
+            3000,
+        );
+        assert!(
+            !url.contains("kenteken+%3C%3D") && !url.contains("kenteken%20%3C%3D"),
+            "an unbounded-above range must not filter by an upper bound: {url}"
+        );
+        assert!(url.contains("5001VH"));
+    }
+
+    #[test]
+    fn happy_path_cursor_overrides_the_range_lower_bound_as_pages_advance() {
+        let url = RdwClient::new(None).vehicle_range_page_url(
+            &["TOYOTA".to_string()],
+            Some("0001VH"),
+            Some("5001VH"),
+            Some("3000VH"),
+            3000,
+        );
+        // The cursor, not the range's own lower bound, must be the filter,
+        // since pages within a range advance past the range's start.
+        assert!(url.contains("3000VH"));
+        assert!(!url.contains("0001VH"));
+    }
+
+    #[tokio::test]
+    async fn happy_path_fetch_vehicle_range_page_returns_rows_within_the_range() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("kenteken,merk\nAA001A,TOYOTA\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let rows = client
+            .fetch_vehicle_range_page(&["TOYOTA".to_string()], None, Some("ZZ999Z"), None, 3000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kenteken(), Some("AA001A"));
+    }
+
+    /// Criterion A.2: the client must explicitly opt into gzip decoding
+    /// (`.gzip(true)`) at construction, so a future `default-features =
+    /// false` on reqwest cannot silently disable transparent decompression.
+    /// This exercises the *behaviour* that call protects: a gzip-encoded
+    /// response body must come back decoded.
+    #[tokio::test]
+    async fn fetch_vehicle_page_gzip_encoded_response_is_transparently_decoded() {
+        use std::io::Write;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let csv_body = "kenteken,merk\nAA001A,TOYOTA\n";
+        encoder.write_all(csv_body.as_bytes()).unwrap();
+        let gzipped = encoder.finish().unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(gzipped, "text/csv"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let rows = client
+            .fetch_vehicle_page(&["TOYOTA".to_string()], None, 50000)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kenteken(), Some("AA001A"));
+    }
+
     #[tokio::test]
     async fn fetch_vehicle_page_happy_path_returns_rows() {
         let server = MockServer::start().await;
@@ -574,8 +911,15 @@ mod tests {
         }
     }
 
-    fn fuel_json(kenteken: &str, volgnummer: u32) -> Value {
-        json!({ "kenteken": kenteken, "brandstof_volgnummer": volgnummer.to_string() })
+    /// Build a fuel CSV response body (header + rows) from `(kenteken,
+    /// volgnummer)` pairs, matching what a real Socrata `.csv` fuel page
+    /// looks like.
+    fn fuel_csv(rows: &[(&str, u32)]) -> String {
+        let mut body = "kenteken,brandstof_volgnummer\n".to_string();
+        for (kenteken, volgnummer) in rows {
+            body.push_str(&format!("{kenteken},{volgnummer}\n"));
+        }
+        body
     }
 
     #[test]
@@ -621,10 +965,10 @@ mod tests {
     async fn fetch_fuel_for_kentekens_happy_path_returns_rows() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(vec![fuel_json("AA001A", 1), fuel_json("AA001A", 2)]),
+                    .set_body_string(fuel_csv(&[("AA001A", 1), ("AA001A", 2)])),
             )
             .mount(&server)
             .await;
@@ -643,8 +987,8 @@ mod tests {
         // dropped batch would silently blank the fuel columns for those cars.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![fuel_json("AA001A", 1)]))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fuel_csv(&[("AA001A", 1)])))
             .mount(&server)
             .await;
 
@@ -671,18 +1015,18 @@ mod tests {
         // would overtake under buffer_unordered.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(vec![fuel_json("AA001A", 1)])
+                    .set_body_string(fuel_csv(&[("AA001A", 1)]))
                     .set_delay(std::time::Duration::from_millis(120)),
             )
             .up_to_n_times(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![fuel_json("ZZ999Z", 1)]))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fuel_csv(&[("ZZ999Z", 1)])))
             .mount(&server)
             .await;
 
@@ -706,7 +1050,7 @@ mod tests {
     async fn fetch_fuel_for_kentekens_failure_propagates_upstream_error() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
@@ -717,6 +1061,62 @@ mod tests {
             .await
             .expect_err("a persistent 500 must surface, not be silently empty");
         assert!(err.to_string().contains("500"), "got: {err}");
+    }
+
+    /// Criterion B.4: a body that reads fully at the HTTP layer but is cut
+    /// off mid-CSV-record (an unterminated quoted field, here) must be an
+    /// error retried like any other transient failure, never mistaken for a
+    /// short-but-complete page.
+    #[tokio::test]
+    async fn fetch_fuel_for_kentekens_truncated_body_is_retried_then_raised_not_silently_short() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    // An opening quote with no closing quote: the record
+                    // never terminates, exactly what a body cut off
+                    // mid-record looks like to the CSV reader.
+                    .set_body_string("kenteken,brandstof_volgnummer\n\"AA001A,1\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let err = client
+            .fetch_fuel_for_kentekens(&["AA001A".to_string()])
+            .await
+            .expect_err("a truncated body must be an error, not a silently short page");
+        assert!(
+            matches!(err, ClientError::RetriesExhausted { .. }),
+            "a truncated-body error must be retried, not returned as a one-shot failure: {err:?}"
+        );
+    }
+
+    /// Criterion 8: `fetch_fuel_for_kentekens` never paginates a batch
+    /// further, so a response landing exactly on the configured `$limit`
+    /// means rows beyond it were silently cut off, and must be rejected
+    /// rather than accepted as a complete (if suspiciously round) page.
+    #[tokio::test]
+    async fn fetch_fuel_for_kentekens_response_exactly_at_limit_is_rejected_as_truncated() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.csv")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(fuel_csv(&[("AA001A", 1)])))
+            .mount(&server)
+            .await;
+
+        let client = fast_client()
+            .with_resource_base(format!("{}/resource", server.uri()))
+            .with_fuel_page_limit(1);
+        let err = client
+            .fetch_fuel_for_kentekens(&["AA001A".to_string()])
+            .await
+            .expect_err("a page landing exactly on $limit must be rejected as truncated");
+        assert!(
+            err.to_string().contains("limit"),
+            "error should explain the exact-limit truncation: {err}"
+        );
     }
 
     #[tokio::test]
@@ -746,6 +1146,74 @@ mod tests {
                 ("gem_lading_wrde".to_string(), "gem_lading_wrde".to_string()),
             ]
         );
+    }
+
+    // --- Criterion V.1: end-to-end row-count reconciliation ---
+
+    #[test]
+    fn vehicle_count_url_uses_select_count_and_the_same_where_clause_as_the_page_url() {
+        let client = RdwClient::new(None);
+        let merken = vec!["TOYOTA".to_string(), "LEXUS".to_string()];
+        let count_url = client.vehicle_count_url(&merken);
+        let page_url = client.vehicle_page_url(&merken, None, 50000);
+
+        assert!(
+            count_url.contains("%24select=count%28kenteken%29")
+                || count_url.contains("$select=count(kenteken)"),
+            "count url must select count(kenteken): {count_url}"
+        );
+        // Both URLs must filter the exact same population: extract the
+        // `$where` value from each and compare, rather than the whole URL
+        // (which differs in $select/$order/$limit).
+        fn where_of(url: &str) -> &str {
+            url.split("$where=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap()
+        }
+        assert_eq!(
+            where_of(&count_url),
+            where_of(&page_url),
+            "count query must filter the same merk population as the page query"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_vehicle_count_happy_path_parses_the_count_column() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("count_kenteken\n824620\n"))
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let count = client
+            .fetch_vehicle_count(&["TOYOTA".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(count, 824620);
+    }
+
+    /// Edge: an upstream failure on the count query must surface as an
+    /// error, never be silently treated as "no reconciliation possible".
+    #[tokio::test]
+    async fn fetch_vehicle_count_persistent_upstream_failure_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{VEHICLE_DATASET_ID}.csv")))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = fast_client().with_resource_base(format!("{}/resource", server.uri()));
+        let err = client
+            .fetch_vehicle_count(&["TOYOTA".to_string()])
+            .await
+            .expect_err("a persistent 500 on the count query must not be swallowed");
+        assert!(matches!(err, ClientError::RetriesExhausted { .. }));
     }
 
     #[tokio::test]

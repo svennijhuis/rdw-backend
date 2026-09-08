@@ -124,23 +124,54 @@ async fn run(
     // at a time via `assembler` so the whole export is never held in
     // memory; the assembler's `finish()` is only ever called after every
     // page has succeeded (step 6), preserving the never-partial guarantee.
-    let widener = RowWidener::new(
+    let widener = Arc::new(RowWidener::new(
         state.metadata.vehicle_columns.clone(),
         state.metadata.fuel_columns.clone(),
-    );
-    let mut assembler = rdw_core::Assembler::new(widener.header());
-    let summary = match fetch_and_widen(
-        &state.client,
-        &brands,
-        limit,
-        &widener,
-        &mut assembler,
-        &state.failure_config,
-    )
-    .await
-    {
+    ));
+    let assembler = Arc::new(tokio::sync::Mutex::new(rdw_core::Assembler::new(
+        widener.header(),
+    )));
+
+    // `limit` keeps the existing sequential single-cursor path unchanged: it
+    // can stop early once enough rows are produced, which unordered
+    // concurrent ranges cannot do without a coordinated row counter this
+    // plan does not add. An unlimited export uses the concurrent range
+    // pipeline (Scope C) for wall-time.
+    let pipeline_result = if let Some(limit) = limit {
+        let mut guard = assembler.lock().await;
+        fetch_and_widen(
+            &state.client,
+            &brands,
+            Some(limit),
+            &widener,
+            &mut guard,
+            &state.failure_config,
+        )
+        .await
+    } else {
+        crate::pipeline::fetch_and_widen_concurrent(
+            &state.client,
+            &brands,
+            widener.clone(),
+            assembler.clone(),
+            &state.failure_config,
+            &state.concurrent_config,
+        )
+        .await
+    };
+
+    let summary = match pipeline_result {
         Ok(summary) => summary,
         Err(err) => {
+            let assembler = Arc::try_unwrap(assembler)
+                .unwrap_or_else(|_| {
+                    unreachable!(
+                        "every range-worker task has joined by the time fetch_and_widen_concurrent \
+                         returns, and the sequential path never clones the Arc, so this is the only \
+                         remaining handle"
+                    )
+                })
+                .into_inner();
             assembler.abort();
             let api_err = pipeline_error_to_api_error(&err);
             if matches!(
@@ -159,6 +190,15 @@ async fn run(
     // produces a valid, deliberately degraded CSV/ZIP (status column,
     // filename, and header all mark it); only a vehicle-page failure or an
     // above-threshold fuel-failure rate reaches step 5's abort path above.
+    let assembler = Arc::try_unwrap(assembler)
+        .unwrap_or_else(|_| {
+            unreachable!(
+                "every range-worker task has joined by the time fetch_and_widen_concurrent \
+                 returns, and the sequential path never clones the Arc, so this is the only \
+                 remaining handle"
+            )
+        })
+        .into_inner();
     let assembled = assembler.finish_with_report(&summary).map_err(|e| {
         release_all(state, &rate_keys, now);
         ApiError::BadGateway(format!("failed to assemble export: {e}"))
@@ -177,7 +217,13 @@ async fn run(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"));
 
-    build_response(&assembled, &summary, accepts_gzip).inspect_err(|_| {
+    build_response(
+        &assembled,
+        &summary,
+        accepts_gzip,
+        state.uncompressed_threshold_bytes,
+    )
+    .inspect_err(|_| {
         release_all(state, &rate_keys, now);
         rdw_core::cleanup(&assembled);
     })
@@ -205,6 +251,9 @@ fn pipeline_error_to_api_error(err: &PipelineError) -> ApiError {
         PipelineError::FuelFailureThresholdExceeded(msg) => {
             ApiError::BadGateway(format!("too many fuel range fetches failed: {msg}"))
         }
+        PipelineError::WorkerPanic(msg) => {
+            ApiError::BadGateway(format!("export worker panicked: {msg}"))
+        }
     }
 }
 
@@ -218,6 +267,7 @@ fn build_response(
     assembled: &Assembled,
     summary: &FuelFailureSummary,
     accepts_gzip: bool,
+    uncompressed_threshold_bytes: u64,
 ) -> Result<Response, ApiError> {
     let file = std::fs::File::open(assembled.path())
         .map_err(|e| ApiError::BadGateway(format!("failed to open export file: {e}")))?;
@@ -270,8 +320,22 @@ fn build_response(
 
     let body = if csv_is_gzipped && !accepts_gzip {
         // The CSV is staged compressed, so a client that cannot accept gzip
-        // gets it expanded on the way out. The length is unknown up front, so
-        // the response is chunked rather than carrying a wrong Content-Length.
+        // gets it expanded on the way out. Above the threshold this would
+        // mean streaming a multi-hundred-MB (or gigabyte) CSV in memory and
+        // wall time for a client that could simply have asked for gzip, so
+        // it is refused with 406 instead.
+        if len > uncompressed_threshold_bytes {
+            return Err(ApiError::NotAcceptable(format!(
+                "Staged data exceeds {} MB; please retry with Accept-Encoding: gzip",
+                uncompressed_threshold_bytes / 1024 / 1024
+            )));
+        }
+        tracing::warn!(
+            staged_bytes = len,
+            "serving uncompressed export: client did not send Accept-Encoding: gzip"
+        );
+        // The length is unknown up front once decompressed, so the response
+        // is chunked rather than carrying a wrong Content-Length.
         let decoded = async_compression::tokio::bufread::GzipDecoder::new(
             tokio::io::BufReader::new(async_file),
         );
@@ -301,4 +365,96 @@ fn seconds_until_next_week(now_unix: i64) -> u64 {
     let week_start_day = ((day_index + 3).div_euclid(7)) * 7 - 3;
     let next_week_start = (week_start_day + 7) * DAY;
     (next_week_start - now_unix).max(0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Stage a real gzip-compressed CSV temp file of at least `min_bytes`
+    /// compressed size, and return an `Assembled::Csv` pointing at it, so
+    /// `build_response`'s threshold check runs against a real file.
+    fn staged_gzip_csv(min_bytes: usize) -> Assembled {
+        let path = std::env::temp_dir().join(format!(
+            "rdw-handlers-test-{}-{}.csv.gz",
+            std::process::id(),
+            rand_suffix()
+        ));
+        let file = std::fs::File::create(&path).unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
+        encoder.write_all(b"kenteken,merk\n").unwrap();
+        // Padding is incompressible (random-looking) so the compressed
+        // output actually grows roughly with the input, keeping the test
+        // fast without needing gigabytes of real data.
+        let mut written = 0usize;
+        while written < min_bytes {
+            let chunk = format!("AA{written:06},TOYOTA-{written}\n");
+            encoder.write_all(chunk.as_bytes()).unwrap();
+            written += chunk.len();
+        }
+        encoder.finish().unwrap();
+        let content_length = std::fs::metadata(&path).unwrap().len();
+        Assembled::Csv {
+            path,
+            content_length,
+        }
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    #[tokio::test]
+    async fn happy_path_uncompressed_below_threshold_streams_200() {
+        let assembled = staged_gzip_csv(100);
+        let response = build_response(
+            &assembled,
+            &FuelFailureSummary::default(),
+            false,
+            50 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn edge_gzip_accepting_client_bypasses_the_threshold_entirely() {
+        // A client that DOES send Accept-Encoding: gzip must never be
+        // refused, no matter how large the staged file is: this is the
+        // browser download flow the 406 must never break (criterion E.4).
+        let assembled = staged_gzip_csv(200);
+        let response = build_response(&assembled, &FuelFailureSummary::default(), true, 1).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_uncompressed_above_threshold_is_rejected_with_406() {
+        let assembled = staged_gzip_csv(200);
+        let err = build_response(&assembled, &FuelFailureSummary::default(), false, 1).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_ACCEPTABLE);
+        assert!(err.message().contains("Accept-Encoding: gzip"));
+    }
+
+    #[tokio::test]
+    async fn edge_threshold_is_strictly_greater_than_not_greater_or_equal() {
+        // A staged file exactly at the threshold must still be served, not
+        // refused: the check is `len > threshold`, not `>=`.
+        let assembled = staged_gzip_csv(200);
+        let exact_len = match &assembled {
+            Assembled::Csv { content_length, .. } => *content_length,
+            _ => unreachable!(),
+        };
+        let response =
+            build_response(&assembled, &FuelFailureSummary::default(), false, exact_len).unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
