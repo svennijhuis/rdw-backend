@@ -82,22 +82,36 @@ async fn run(
     let limit = parse_limit(params.get("limit").map(String::as_str))
         .map_err(|e| ApiError::BadRequest(e.0))?;
 
-    // 3. Rate limit: fixed window, keyed by API key.
+    // 3. Rate limit: fixed window, keyed by API key AND brand. The budget is
+    // per brand rather than per request, so a day's worth of Toyota does not
+    // eat the allowance for Lexus. A request naming several brands draws one
+    // from each of their budgets.
     let now = now_unix();
     state.rate_limiter.evict_stale(now);
-    let rate_key = format!("key:{api_key}");
-    match state.rate_limiter.check_and_record(&rate_key, now) {
-        RateLimitOutcome::DayExceeded => {
-            return Err(ApiError::RateLimited {
-                retry_after_secs: seconds_until_next_day(now),
-            })
+    let rate_keys: Vec<String> = brands
+        .iter()
+        .map(|brand| format!("key:{api_key}|merk:{brand}"))
+        .collect();
+
+    let mut recorded: Vec<&String> = Vec::with_capacity(rate_keys.len());
+    for rate_key in &rate_keys {
+        match state.rate_limiter.check_and_record(rate_key, now) {
+            RateLimitOutcome::Allowed => recorded.push(rate_key),
+            outcome => {
+                // One brand is over its budget, so the request is refused. Give
+                // back what the brands checked before it already consumed;
+                // charging for an export that never runs would silently drain
+                // the other brands' allowances.
+                for done in &recorded {
+                    state.rate_limiter.release(done, now);
+                }
+                let retry_after_secs = match outcome {
+                    RateLimitOutcome::WeekExceeded => seconds_until_next_week(now),
+                    _ => seconds_until_next_day(now),
+                };
+                return Err(ApiError::RateLimited { retry_after_secs });
+            }
         }
-        RateLimitOutcome::WeekExceeded => {
-            return Err(ApiError::RateLimited {
-                retry_after_secs: seconds_until_next_week(now),
-            })
-        }
-        RateLimitOutcome::Allowed => {}
     }
 
     // 4. Concurrency guard: only one export at a time.
@@ -135,7 +149,7 @@ async fn run(
             ) {
                 // A 502/504 upstream failure (vehicle-page failure, or the
                 // fuel-failure threshold exceeded) must not consume quota.
-                state.rate_limiter.release(&rate_key, now);
+                release_all(state, &rate_keys, now);
             }
             return Err(api_err);
         }
@@ -146,7 +160,7 @@ async fn run(
     // filename, and header all mark it); only a vehicle-page failure or an
     // above-threshold fuel-failure rate reaches step 5's abort path above.
     let assembled = assembler.finish_with_report(&summary).map_err(|e| {
-        state.rate_limiter.release(&rate_key, now);
+        release_all(state, &rate_keys, now);
         ApiError::BadGateway(format!("failed to assemble export: {e}"))
     })?;
 
@@ -164,9 +178,18 @@ async fn run(
         .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"));
 
     build_response(&assembled, &summary, accepts_gzip).inspect_err(|_| {
-        state.rate_limiter.release(&rate_key, now);
+        release_all(state, &rate_keys, now);
         rdw_core::cleanup(&assembled);
     })
+}
+
+/// Give back the quota this request drew from every brand it named. Used on the
+/// upstream-failure paths, where the caller never received an export and so
+/// must not be charged for one.
+fn release_all(state: &AppState, rate_keys: &[String], now: i64) {
+    for key in rate_keys {
+        state.rate_limiter.release(key, now);
+    }
 }
 
 fn pipeline_error_to_api_error(err: &PipelineError) -> ApiError {

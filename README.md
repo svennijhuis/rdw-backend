@@ -84,9 +84,15 @@ failures.
 
 ## Rate limits
 
-Three requests per day and five per week, counted per API key. A request without a valid key is
-rejected with 401 before the limiter is consulted, so a bad key cannot burn someone else's quota.
-One export runs at a time; a second concurrent request gets 429.
+Three requests per day and five per week, counted **per API key and per brand**. Spending Toyota's
+daily allowance leaves Lexus and Suzuki untouched, so the three brands each get their own budget.
+
+A request naming several brands draws one from each of their budgets. If any named brand is already
+exhausted the whole request is refused with 429, and the brands checked before it get their
+reservation back — a refused request never costs quota.
+
+A request without a valid key is rejected with 401 before the limiter is consulted, so a bad key
+cannot burn someone else's quota. One export runs at a time; a second concurrent request gets 429.
 
 Counters live in memory, so they reset when the process restarts — on a serverless host, that means
 every cold start. A request that ends in 502 or 504 does not consume quota.

@@ -852,3 +852,80 @@ async fn small_limit_requests_a_small_vehicle_page_not_the_full_50000() {
         );
     }
 }
+
+/// The daily budget is per brand, not per request: spending Toyota's allowance
+/// must leave Lexus untouched.
+#[tokio::test]
+async fn rate_limit_is_counted_per_brand_not_per_request() {
+    let server = MockServer::start().await;
+    mount_vehicle_page(&server, json!([])).await;
+    mount_fuel_range(&server, json!([])).await;
+    let app = build_app(&server).await;
+
+    let get = |brands: &str| {
+        let app = app.clone();
+        let uri = format!("/api/v1/fuel?brands={brands}&api_key={API_KEY}");
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Exhaust Toyota's day budget.
+    for i in 0..3 {
+        assert_eq!(get("toyota").await, StatusCode::OK, "toyota request {i}");
+    }
+    assert_eq!(
+        get("toyota").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the fourth toyota request must be refused"
+    );
+
+    // Lexus has its own budget and is unaffected.
+    assert_eq!(
+        get("lexus").await,
+        StatusCode::OK,
+        "lexus must not be charged for toyota's requests"
+    );
+}
+
+/// A request naming several brands draws from each of their budgets, and when
+/// one of them is exhausted the others must not be charged for the refusal.
+#[tokio::test]
+async fn rate_limit_refusal_does_not_charge_the_other_brands() {
+    let server = MockServer::start().await;
+    mount_vehicle_page(&server, json!([])).await;
+    mount_fuel_range(&server, json!([])).await;
+    let app = build_app(&server).await;
+
+    let get = |brands: &str| {
+        let app = app.clone();
+        let uri = format!("/api/v1/fuel?brands={brands}&api_key={API_KEY}");
+        async move {
+            app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // Use up Suzuki only.
+    for _ in 0..3 {
+        assert_eq!(get("suzuki").await, StatusCode::OK);
+    }
+
+    // Asking for lexus+suzuki is refused because suzuki is exhausted.
+    assert_eq!(get("lexus,suzuki").await, StatusCode::TOO_MANY_REQUESTS);
+
+    // Lexus must still have its full budget: the refused request checked lexus
+    // first, and that reservation has to be given back.
+    for i in 0..3 {
+        assert_eq!(
+            get("lexus").await,
+            StatusCode::OK,
+            "lexus request {i} must still be allowed after the refused combined request"
+        );
+    }
+}
