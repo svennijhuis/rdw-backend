@@ -234,14 +234,17 @@ mod tests {
     }
 
     #[test]
-    fn fallback_columns_widen_to_full_203_column_header() {
-        // 98 vehicle columns + 3 fuel slots * 35 non-kenteken fuel columns = 203.
+    fn fallback_columns_widen_to_full_204_column_header() {
+        // 98 vehicle columns + 3 fuel slots * 35 non-kenteken fuel columns
+        // + 1 export_status column (last position) = 204.
         assert_eq!(fallback_vehicle_columns().len(), 98);
         assert_eq!(fallback_fuel_columns().len(), 36);
 
         let widener =
             crate::widen::RowWidener::new(fallback_vehicle_columns(), fallback_fuel_columns());
-        assert_eq!(widener.header().len(), 98 + 3 * 35);
+        let header = widener.header();
+        assert_eq!(header.len(), 98 + 3 * 35 + 1);
+        assert_eq!(header.last().unwrap(), "export_status");
     }
 
     #[tokio::test]

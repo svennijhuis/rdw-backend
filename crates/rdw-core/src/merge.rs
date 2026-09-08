@@ -9,11 +9,40 @@ use rdw_client::{FuelRow, VehicleRow};
 
 pub const MAX_FUEL_ENTRIES: usize = 3;
 
+/// The three-value export status vocabulary, exported as the CSV's final
+/// `export_status` column. Two values (present/blank) would be ambiguous: a
+/// vehicle with genuinely no fuel rows in `8ys7-d773` is indistinguishable
+/// from one whose fuel range fetch failed unless failure is tracked
+/// separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportStatus {
+    /// Fuel rows were returned for this vehicle.
+    Ok,
+    /// The fuel range fetch succeeded, but this kenteken genuinely has no
+    /// rows in the fuel dataset (a common, legitimate orphan case).
+    NoFuelData,
+    /// The fuel range fetch for this vehicle's kenteken range failed after
+    /// exhausting retries; fuel1_*/fuel2_*/fuel3_* are blank, not because
+    /// the vehicle has no fuel data, but because it could not be fetched.
+    FuelUnavailable,
+}
+
+impl ExportStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExportStatus::Ok => "ok",
+            ExportStatus::NoFuelData => "no_fuel_data",
+            ExportStatus::FuelUnavailable => "fuel_unavailable",
+        }
+    }
+}
+
 /// One vehicle widened with up to `MAX_FUEL_ENTRIES` fuel entries.
 #[derive(Debug, Clone)]
 pub struct WidenedRow {
     pub vehicle: VehicleRow,
     pub fuels: Vec<FuelRow>,
+    pub export_status: ExportStatus,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -43,9 +72,17 @@ pub enum MergeJoinError {
 ///   corrupt output.
 /// - A 4th (or later) fuel entry for one vehicle fails loudly rather than
 ///   being silently dropped.
+/// - `fuel_fetch_failed` marks every vehicle in `vehicles` with
+///   `ExportStatus::FuelUnavailable` regardless of `fuel` (the caller passes
+///   an empty slice in this case): the fuel range for this vehicle batch
+///   could not be fetched at all, which is a fetch failure, not a genuine
+///   absence of fuel data. Otherwise each vehicle's status is `Ok` when
+///   matching fuel rows were found, or `NoFuelData` when the fetch
+///   succeeded but no rows matched.
 pub fn merge_join(
     vehicles: &[VehicleRow],
     fuel: &[FuelRow],
+    fuel_fetch_failed: bool,
 ) -> Result<Vec<WidenedRow>, MergeJoinError> {
     validate_vehicle_order(vehicles)?;
     validate_fuel_order(fuel)?;
@@ -94,9 +131,18 @@ pub fn merge_join(
             }
         }
 
+        let export_status = if fuel_fetch_failed {
+            ExportStatus::FuelUnavailable
+        } else if fuels_for_v.is_empty() {
+            ExportStatus::NoFuelData
+        } else {
+            ExportStatus::Ok
+        };
+
         result.push(WidenedRow {
             vehicle: v.clone(),
             fuels: fuels_for_v,
+            export_status,
         });
     }
 
@@ -163,7 +209,7 @@ mod tests {
     fn happy_path_two_vehicles_different_fuel_counts() {
         let vehicles = vec![vehicle("AA001A"), vehicle("BB002B")];
         let fuels = vec![fuel("AA001A", 1), fuel("AA001A", 2), fuel("BB002B", 1)];
-        let widened = merge_join(&vehicles, &fuels).unwrap();
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
         assert_eq!(widened.len(), 2);
         assert_eq!(widened[0].fuels.len(), 2);
         assert_eq!(widened[1].fuels.len(), 1);
@@ -174,7 +220,7 @@ mod tests {
         let vehicles = vec![vehicle("BB002B")];
         // "AA001A" fuel entry has no matching vehicle in this batch.
         let fuels = vec![fuel("AA001A", 1), fuel("BB002B", 1)];
-        let widened = merge_join(&vehicles, &fuels).unwrap();
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
         assert_eq!(widened.len(), 1);
         assert_eq!(widened[0].vehicle.kenteken(), Some("BB002B"));
         assert_eq!(widened[0].fuels.len(), 1);
@@ -184,7 +230,7 @@ mod tests {
     fn edge_vehicle_with_zero_fuel_entries() {
         let vehicles = vec![vehicle("AA001A")];
         let fuels = vec![];
-        let widened = merge_join(&vehicles, &fuels).unwrap();
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
         assert_eq!(widened[0].fuels.len(), 0);
     }
 
@@ -197,7 +243,7 @@ mod tests {
             fuel("AA001A", 3),
             fuel("AA001A", 4),
         ];
-        let err = merge_join(&vehicles, &fuels).unwrap_err();
+        let err = merge_join(&vehicles, &fuels, false).unwrap_err();
         assert_eq!(
             err,
             MergeJoinError::TooManyFuelEntries("AA001A".to_string())
@@ -209,14 +255,14 @@ mod tests {
         let vehicles = vec![vehicle("AA001A")];
         // volgnummer 1 then 3: sequence gap/inversion relative to expected 2.
         let fuels = vec![fuel("AA001A", 1), fuel("AA001A", 3)];
-        let err = merge_join(&vehicles, &fuels).unwrap_err();
+        let err = merge_join(&vehicles, &fuels, false).unwrap_err();
         assert!(matches!(err, MergeJoinError::FuelInversion(_, 2, 3)));
     }
 
     #[test]
     fn failure_unsorted_vehicle_cursor_is_detected() {
         let vehicles = vec![vehicle("BB002B"), vehicle("AA001A")];
-        let err = merge_join(&vehicles, &[]).unwrap_err();
+        let err = merge_join(&vehicles, &[], false).unwrap_err();
         assert_eq!(err, MergeJoinError::UnsortedVehicles("AA001A".to_string()));
     }
 
@@ -225,7 +271,59 @@ mod tests {
         let vehicles = vec![vehicle("AA001A"), vehicle("BB002B")];
         // Fuel page returned out of order relative to kenteken ordering.
         let fuels = vec![fuel("BB002B", 1), fuel("AA001A", 1)];
-        let err = merge_join(&vehicles, &fuels).unwrap_err();
+        let err = merge_join(&vehicles, &fuels, false).unwrap_err();
         assert_eq!(err, MergeJoinError::UnsortedFuel("AA001A".to_string()));
+    }
+
+    // Criterion 3: the three-value status vocabulary.
+
+    #[test]
+    fn happy_path_fuel_rows_present_sets_status_ok() {
+        let vehicles = vec![vehicle("AA001A")];
+        let fuels = vec![fuel("AA001A", 1)];
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
+        assert_eq!(widened[0].export_status, ExportStatus::Ok);
+    }
+
+    #[test]
+    fn edge_fetch_succeeded_but_no_fuel_rows_sets_status_no_fuel_data() {
+        // Fetch succeeded (fuel_fetch_failed = false) but this kenteken
+        // genuinely has no rows in the fuel dataset: a common orphan case,
+        // distinct from a failed fetch.
+        let vehicles = vec![vehicle("AA001A")];
+        let widened = merge_join(&vehicles, &[], false).unwrap();
+        assert_eq!(widened[0].export_status, ExportStatus::NoFuelData);
+        assert_eq!(widened[0].fuels.len(), 0);
+    }
+
+    #[test]
+    fn failure_fetch_failed_sets_status_fuel_unavailable_even_with_no_rows() {
+        let vehicles = vec![vehicle("AA001A"), vehicle("BB002B")];
+        // Caller passes an empty fuel slice when the range fetch failed,
+        // exactly like the no-fuel-data case, but the failure flag must
+        // still distinguish the two.
+        let widened = merge_join(&vehicles, &[], true).unwrap();
+        assert_eq!(widened.len(), 2);
+        assert_eq!(widened[0].export_status, ExportStatus::FuelUnavailable);
+        assert_eq!(widened[1].export_status, ExportStatus::FuelUnavailable);
+        assert!(widened[0].fuels.is_empty());
+    }
+
+    #[test]
+    fn edge_fuel_fetch_failed_overrides_status_even_if_rows_were_somehow_present() {
+        // Defensive: if a caller ever passed fuel_fetch_failed=true together
+        // with non-empty fuel rows, the failure flag still wins, since the
+        // production caller's contract is "failed range => empty fuel".
+        let vehicles = vec![vehicle("AA001A")];
+        let fuels = vec![fuel("AA001A", 1)];
+        let widened = merge_join(&vehicles, &fuels, true).unwrap();
+        assert_eq!(widened[0].export_status, ExportStatus::FuelUnavailable);
+    }
+
+    #[test]
+    fn export_status_as_str_matches_the_three_value_vocabulary() {
+        assert_eq!(ExportStatus::Ok.as_str(), "ok");
+        assert_eq!(ExportStatus::NoFuelData.as_str(), "no_fuel_data");
+        assert_eq!(ExportStatus::FuelUnavailable.as_str(), "fuel_unavailable");
     }
 }

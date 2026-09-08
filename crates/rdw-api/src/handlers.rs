@@ -8,14 +8,20 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{ConnectInfo, RawQuery, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::errors::{render_to_response, ApiError};
 use crate::extractors::{extract_api_key, parse_brands, parse_limit};
 use crate::pipeline::{fetch_and_widen, PipelineError};
 use crate::state::AppState;
-use rdw_core::{Assembled, RateLimitOutcome, RowWidener};
+use rdw_core::{Assembled, FuelFailureSummary, RateLimitOutcome, RowWidener};
+
+/// Response header naming the fuel-failure count and affected vehicle count
+/// on a partial (degraded) export. A browser download never surfaces
+/// response headers to the user, so this is a supplementary machine-readable
+/// signal; the filename (see `build_response`) is what a human sees.
+const EXPORT_WARNINGS_HEADER: &str = "x-export-warnings";
 
 fn now_unix() -> i64 {
     SystemTime::now()
@@ -108,27 +114,42 @@ async fn run(
         state.metadata.fuel_columns.clone(),
     );
     let mut assembler = rdw_core::Assembler::new(widener.header());
-    if let Err(err) = fetch_and_widen(&state.client, &brands, limit, &widener, &mut assembler).await
+    let summary = match fetch_and_widen(
+        &state.client,
+        &brands,
+        limit,
+        &widener,
+        &mut assembler,
+        &state.failure_config,
+    )
+    .await
     {
-        assembler.abort();
-        let api_err = pipeline_error_to_api_error(&err);
-        if matches!(
-            api_err,
-            ApiError::BadGateway(_) | ApiError::GatewayTimeout(_)
-        ) {
-            // A 502/504 upstream failure must not consume quota.
-            state.rate_limiter.release(&rate_key, now);
+        Ok(summary) => summary,
+        Err(err) => {
+            assembler.abort();
+            let api_err = pipeline_error_to_api_error(&err);
+            if matches!(
+                api_err,
+                ApiError::BadGateway(_) | ApiError::GatewayTimeout(_)
+            ) {
+                // A 502/504 upstream failure (vehicle-page failure, or the
+                // fuel-failure threshold exceeded) must not consume quota.
+                state.rate_limiter.release(&rate_key, now);
+            }
+            return Err(api_err);
         }
-        return Err(api_err);
-    }
+    };
 
-    // 6. Close staging; never send partial output.
-    let assembled = assembler.finish().map_err(|e| {
+    // 6. Close staging. A fuel-range failure below the abort threshold still
+    // produces a valid, deliberately degraded CSV/ZIP (status column,
+    // filename, and header all mark it); only a vehicle-page failure or an
+    // above-threshold fuel-failure rate reaches step 5's abort path above.
+    let assembled = assembler.finish_with_report(&summary).map_err(|e| {
         state.rate_limiter.release(&rate_key, now);
         ApiError::BadGateway(format!("failed to assemble export: {e}"))
     })?;
 
-    let response = build_response(&assembled);
+    let response = build_response(&assembled, &summary);
     rdw_core::cleanup(&assembled);
     response
 }
@@ -143,16 +164,34 @@ fn pipeline_error_to_api_error(err: &PipelineError) -> ApiError {
         PipelineError::Assembly(msg) => {
             ApiError::BadGateway(format!("failed to assemble export: {msg}"))
         }
+        PipelineError::FuelFailureThresholdExceeded(msg) => {
+            ApiError::BadGateway(format!("too many fuel range fetches failed: {msg}"))
+        }
     }
 }
 
-fn build_response(assembled: &Assembled) -> Result<Response, ApiError> {
+/// Build the export response. On any fuel failure the filename is marked
+/// `-PARTIAL` (a browser download surfaces the filename, never response
+/// headers, so this is the layer a human actually sees) and the
+/// `X-Export-Warnings` header names the failure and affected-vehicle
+/// counts, for API clients that inspect headers rather than the CSV's
+/// `export_status` column.
+fn build_response(
+    assembled: &Assembled,
+    summary: &FuelFailureSummary,
+) -> Result<Response, ApiError> {
     let bytes = std::fs::read(assembled.path())
         .map_err(|e| ApiError::BadGateway(format!("failed to read export file: {e}")))?;
 
-    let (content_type, filename) = match assembled {
-        Assembled::Csv { .. } => ("text/csv", "fuel-export.csv"),
-        Assembled::Zip { .. } => ("application/zip", "fuel-export.zip"),
+    let (content_type, extension) = match assembled {
+        Assembled::Csv { .. } => ("text/csv", "csv"),
+        Assembled::Zip { .. } => ("application/zip", "zip"),
+    };
+    let partial = summary.has_failures();
+    let filename = if partial {
+        format!("fuel-export-PARTIAL.{extension}")
+    } else {
+        format!("fuel-export.{extension}")
     };
 
     let mut headers = HeaderMap::new();
@@ -163,6 +202,15 @@ fn build_response(assembled: &Assembled) -> Result<Response, ApiError> {
     );
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    if partial {
+        let value = format!(
+            "fuel_failures={} vehicles_affected={}",
+            summary.failures, summary.vehicles_affected
+        );
+        if let Ok(hv) = HeaderValue::from_str(&value) {
+            headers.insert(HeaderName::from_static(EXPORT_WARNINGS_HEADER), hv);
+        }
     }
 
     Ok((StatusCode::OK, headers, bytes).into_response())

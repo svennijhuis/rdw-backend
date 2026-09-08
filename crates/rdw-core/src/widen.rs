@@ -27,7 +27,11 @@ impl RowWidener {
         }
     }
 
-    /// Header row: vehicle columns, then `fuel1_*`, `fuel2_*`, `fuel3_*`.
+    /// Header row: vehicle columns, then `fuel1_*`, `fuel2_*`, `fuel3_*`,
+    /// then `export_status` last. The status column's position is final: it
+    /// must never move earlier, because `widen()` builds rows positionally
+    /// and existing consumers (and tests) assert fixed column indices for
+    /// the 203-wide vehicle+fuel prefix.
     pub fn header(&self) -> Vec<String> {
         let mut header = self.vehicle_columns.clone();
         for slot in 1..=MAX_FUEL_ENTRIES {
@@ -35,6 +39,7 @@ impl RowWidener {
                 header.push(format!("fuel{slot}_{col}"));
             }
         }
+        header.push("export_status".to_string());
         header
     }
 
@@ -53,6 +58,7 @@ impl RowWidener {
                 }
             }
         }
+        out.push(row.export_status.as_str().to_string());
         out
     }
 }
@@ -97,6 +103,7 @@ mod tests {
                 "fuel2_brandstof_omschrijving",
                 "fuel3_brandstof_volgnummer",
                 "fuel3_brandstof_omschrijving",
+                "export_status",
             ]
         );
     }
@@ -109,9 +116,12 @@ mod tests {
                 .unwrap()
                 .clone(),
         )];
-        let widened = merge_join(&vehicles, &[]).unwrap();
+        let widened = merge_join(&vehicles, &[], false).unwrap();
         let row = widener().widen(&widened[0]);
-        assert_eq!(row, vec!["AA001A", "TOYOTA", "", "", "", "", "", ""]);
+        assert_eq!(
+            row,
+            vec!["AA001A", "TOYOTA", "", "", "", "", "", "", "no_fuel_data"]
+        );
     }
 
     #[test]
@@ -132,11 +142,68 @@ mod tests {
                 )
             })
             .collect();
-        let widened = merge_join(&vehicles, &fuels).unwrap();
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
         let row = widener().widen(&widened[0]);
+        // Existing positional assertions on the vehicle/fuel prefix must
+        // stay unchanged: the status column is appended, never inserted.
         assert_eq!(row[2], "1");
         assert_eq!(row[3], "Benzine1");
         assert_eq!(row[6], "3");
         assert_eq!(row[7], "Benzine3");
+    }
+
+    // Criterion 2: export_status column at the final position, three values.
+
+    #[test]
+    fn happy_path_status_column_is_last_and_ok_when_fuel_present() {
+        let vehicles = vec![VehicleRow(
+            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )];
+        let fuels = vec![FuelRow(
+            json!({ "kenteken": "AA001A", "brandstof_volgnummer": "1", "brandstof_omschrijving": "Benzine" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )];
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
+        let row = widener().widen(&widened[0]);
+        let header = widener().header();
+        let status_index = header.len() - 1;
+        assert_eq!(header[status_index], "export_status");
+        assert_eq!(row[status_index], "ok");
+        assert_eq!(row.len(), header.len());
+    }
+
+    #[test]
+    fn edge_status_column_is_no_fuel_data_when_fetch_succeeded_with_zero_rows() {
+        let vehicles = vec![VehicleRow(
+            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )];
+        let widened = merge_join(&vehicles, &[], false).unwrap();
+        let row = widener().widen(&widened[0]);
+        assert_eq!(*row.last().unwrap(), "no_fuel_data");
+    }
+
+    #[test]
+    fn failure_status_column_is_fuel_unavailable_when_range_fetch_failed() {
+        let vehicles = vec![VehicleRow(
+            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )];
+        let widened = merge_join(&vehicles, &[], true).unwrap();
+        let row = widener().widen(&widened[0]);
+        assert_eq!(*row.last().unwrap(), "fuel_unavailable");
+        // Fuel columns stay blank, exactly like the no_fuel_data case; only
+        // the status column distinguishes fetch failure from genuine
+        // absence.
+        assert_eq!(&row[2..8], ["", "", "", "", "", ""]);
     }
 }

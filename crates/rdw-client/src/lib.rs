@@ -15,6 +15,12 @@ pub const VEHICLE_DATASET_ID: &str = "m9d7-ebf2";
 /// Fuel dataset id (`brandstof`).
 pub const FUEL_DATASET_ID: &str = "8ys7-d773";
 
+/// Socrata's own per-request row cap. A fuel kenteken range spanning three
+/// whole brands regularly holds far more rows than this, so
+/// `fetch_fuel_range` keyset-paginates by `(kenteken, brandstof_volgnummer)`
+/// rather than trusting a single `$limit` request to return everything.
+pub const DEFAULT_FUEL_PAGE_LIMIT: u32 = 50_000;
+
 const SOCRATA_BASE: &str = "https://opendata.rdw.nl/resource";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -108,9 +114,22 @@ pub struct RdwClient {
     resource_base: String,
     metadata_base: String,
     retry_config: RetryConfig,
+    fuel_page_limit: u32,
 }
 
 const DEFAULT_METADATA_BASE: &str = "https://opendata.rdw.nl/api/views";
+
+/// Where the next fuel-range page resumes.
+///
+/// `inclusive` is true when the previous page's trailing kenteken group was
+/// dropped because it may have been cut in half by the page limit: that whole
+/// group still has to be fetched, so the next page must include it rather than
+/// step past it.
+#[derive(Debug, Clone, Copy)]
+pub struct FuelCursor<'a> {
+    pub kenteken: &'a str,
+    pub inclusive: bool,
+}
 
 impl RdwClient {
     pub fn new(app_token: Option<String>) -> Self {
@@ -124,6 +143,7 @@ impl RdwClient {
             resource_base: SOCRATA_BASE.to_string(),
             metadata_base: DEFAULT_METADATA_BASE.to_string(),
             retry_config: RetryConfig::default(),
+            fuel_page_limit: DEFAULT_FUEL_PAGE_LIMIT,
         }
     }
 
@@ -145,6 +165,15 @@ impl RdwClient {
     /// delays while still exercising the retry decision logic.
     pub fn with_retry_config(mut self, retry_config: RetryConfig) -> Self {
         self.retry_config = retry_config;
+        self
+    }
+
+    /// Override the per-page row limit used by `fetch_fuel_range`'s keyset
+    /// pagination. Test-only hook so pagination itself can be exercised
+    /// without constructing tens of thousands of mock rows; production
+    /// always uses `DEFAULT_FUEL_PAGE_LIMIT`, matching Socrata's cap.
+    pub fn with_fuel_page_limit(mut self, limit: u32) -> Self {
+        self.fuel_page_limit = limit;
         self
     }
 
@@ -173,19 +202,40 @@ impl RdwClient {
         )
     }
 
-    /// Build the SODA URL for the fuel rows covering a vehicle batch's
-    /// kenteken range (inclusive), ordered so the merge-join can validate
-    /// per-vehicle sequencing.
-    pub fn fuel_range_url(&self, lo: &str, hi: &str) -> String {
-        let where_clause = format!(
+    /// Build the SODA URL for one keyset page of the fuel rows covering a
+    /// vehicle batch's kenteken range (inclusive), ordered so the merge-join
+    /// can validate per-vehicle sequencing. `after` is the `(kenteken,
+    /// brandstof_volgnummer)` cursor from the previous page's last row, so a
+    /// range larger than one page is fetched by resuming exactly where the
+    /// prior page ended rather than restarting from `lo`.
+    /// Build one fuel-range page URL.
+    ///
+    /// `after` is a kenteken, and the cursor clause is a plain text
+    /// comparison on that column alone. It deliberately does NOT reference
+    /// `brandstof_volgnummer`: RDW stores that column as TEXT, so comparing
+    /// it against a number makes Socrata reject the whole query with
+    /// `query.soql.type-mismatch` (verified live against opendata.rdw.nl),
+    /// and comparing it as text would order "10" before "2". Whole kenteken
+    /// groups are therefore the pagination unit; `fetch_fuel_range` never
+    /// splits one group across pages.
+    pub fn fuel_range_url(&self, lo: &str, hi: &str, after: Option<FuelCursor<'_>>) -> String {
+        let mut where_clause = format!(
             "kenteken >= '{}' AND kenteken <= '{}'",
             escape_soql(lo),
             escape_soql(hi)
         );
+        if let Some(cursor) = after {
+            let op = if cursor.inclusive { ">=" } else { ">" };
+            where_clause.push_str(&format!(
+                " AND kenteken {op} '{}'",
+                escape_soql(cursor.kenteken)
+            ));
+        }
         format!(
-            "{}/{FUEL_DATASET_ID}.json?$where={}&$order=kenteken,brandstof_volgnummer&$limit=50000",
+            "{}/{FUEL_DATASET_ID}.json?$where={}&$order=kenteken,brandstof_volgnummer&$limit={}",
             self.resource_base,
-            urlencoding_soql(&where_clause)
+            urlencoding_soql(&where_clause),
+            self.fuel_page_limit
         )
     }
 
@@ -201,11 +251,101 @@ impl RdwClient {
         Ok(rows.into_iter().map(VehicleRow).collect())
     }
 
-    /// Fetch all fuel rows in a kenteken range with retry-with-backoff.
+    /// Fetch every fuel row in a kenteken range, keyset-paginating past
+    /// Socrata's per-request row cap. A response at exactly the configured
+    /// page limit is treated as "there is more": the next page resumes from
+    /// the last row's `(kenteken, brandstof_volgnummer)` cursor, splitting
+    /// only between pages (never fabricating a boundary inside one
+    /// kenteken's volgnummer group, since the cursor always resumes at the
+    /// exact next row). Paging stops once a short page (fewer rows than the
+    /// limit) is returned. Each page fetch retries with backoff via
+    /// `get_json_array`; a page that exhausts its retries fails the whole
+    /// range fetch.
     pub async fn fetch_fuel_range(&self, lo: &str, hi: &str) -> Result<Vec<FuelRow>, ClientError> {
-        let url = self.fuel_range_url(lo, hi);
-        let rows = self.get_json_array(&url).await?;
-        Ok(rows.into_iter().map(FuelRow).collect())
+        let mut all: Vec<FuelRow> = Vec::new();
+        let mut cursor: Option<(String, bool)> = None;
+        // A misbehaving upstream that ignores the cursor would otherwise spin
+        // this loop forever and grow `all` without bound. Refusing to page
+        // more times than the range could possibly contain turns that into a
+        // clean error, so the export fails loudly instead of hanging or
+        // emitting a silently wrong CSV.
+        let mut pages_fetched: u32 = 0;
+        const MAX_FUEL_PAGES: u32 = 10_000;
+
+        loop {
+            pages_fetched += 1;
+            if pages_fetched > MAX_FUEL_PAGES {
+                return Err(ClientError::Decode(format!(
+                    "fuel range {lo}..{hi} exceeded {MAX_FUEL_PAGES} pages; \
+                     upstream is not honouring the kenteken cursor"
+                )));
+            }
+            let url = self.fuel_range_url(
+                lo,
+                hi,
+                cursor.as_ref().map(|(k, inclusive)| FuelCursor {
+                    kenteken: k.as_str(),
+                    inclusive: *inclusive,
+                }),
+            );
+            let mut page: Vec<FuelRow> = self
+                .get_json_array(&url)
+                .await?
+                .into_iter()
+                .map(FuelRow)
+                .collect();
+            let page_len = page.len() as u32;
+
+            if page.is_empty() {
+                break;
+            }
+
+            let last_kenteken = page
+                .last()
+                .and_then(|r| r.kenteken())
+                .ok_or_else(|| ClientError::Decode("fuel row missing kenteken".to_string()))?
+                .to_string();
+
+            if page_len < self.fuel_page_limit {
+                // Short page: the range is exhausted, so the trailing group is
+                // whole and every row is kept.
+                all.extend(page);
+                break;
+            }
+
+            let first_kenteken = page
+                .first()
+                .and_then(|r| r.kenteken())
+                .ok_or_else(|| ClientError::Decode("fuel row missing kenteken".to_string()))?
+                .to_string();
+
+            if first_kenteken == last_kenteken {
+                // The page holds a single kenteken, so trimming it would leave
+                // nothing and stall. Keep it and step strictly past it; one
+                // plate has at most a handful of fuel rows, far below any sane
+                // page limit, so this branch means the whole group is present.
+                all.extend(page);
+                cursor = Some((last_kenteken, false));
+            } else {
+                // A full page's trailing group may be cut in half. Drop it and
+                // re-request it INCLUSIVELY on the next page, so it is fetched
+                // whole rather than skipped.
+                if cursor.as_ref().is_some_and(|(k, inclusive)| {
+                    *inclusive && k.as_str() == last_kenteken.as_str()
+                }) {
+                    // The previous page already resumed inclusively at this
+                    // same kenteken, so trimming again would make no progress.
+                    return Err(ClientError::Decode(format!(
+                        "fuel range {lo}..{hi} stalled at kenteken {last_kenteken}"
+                    )));
+                }
+                page.retain(|r| r.kenteken() != Some(last_kenteken.as_str()));
+                all.extend(page);
+                cursor = Some((last_kenteken, true));
+            }
+        }
+
+        Ok(all)
     }
 
     /// Fetch and parse the RDW dataset metadata used for CSV column headers.
@@ -456,6 +596,161 @@ mod tests {
             ClientError::RetriesExhausted { attempts, .. } => assert_eq!(attempts, 5),
             other => panic!("expected RetriesExhausted, got {other:?}"),
         }
+    }
+
+    fn fuel_json(kenteken: &str, volgnummer: u32) -> Value {
+        json!({ "kenteken": kenteken, "brandstof_volgnummer": volgnummer.to_string() })
+    }
+
+    #[test]
+    fn fuel_range_url_first_page_has_no_cursor_clause() {
+        let url = RdwClient::new(None).fuel_range_url("AA001A", "ZZ999Z", None);
+        assert!(!url.contains("kenteken+%3E") || !url.contains("brandstof_volgnummer+%3E"));
+        assert!(url.contains("kenteken"));
+    }
+
+    #[test]
+    fn fuel_range_url_with_cursor_encodes_after_clause() {
+        let url = RdwClient::new(None).fuel_range_url(
+            "AA001A",
+            "ZZ999Z",
+            Some(FuelCursor {
+                kenteken: "BB002B",
+                inclusive: false,
+            }),
+        );
+        // The cursor clause resumes after a whole kenteken group and must
+        // never compare brandstof_volgnummer: RDW stores that column as text,
+        // so a numeric comparison makes Socrata reject the query outright.
+        assert!(url.contains("BB002B"));
+        assert!(!url.contains("brandstof_volgnummer+%3E"));
+        assert!(!url.contains("brandstof_volgnummer >"));
+    }
+
+    /// Criterion 1, happy path: a fuel range under one page's limit is
+    /// fetched in a single request and returned complete.
+    #[tokio::test]
+    async fn fetch_fuel_range_happy_path_single_page_under_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![fuel_json("AA001A", 1), fuel_json("AA001A", 2)]),
+            )
+            .mount(&server)
+            .await;
+
+        let client = fast_client()
+            .with_resource_base(format!("{}/resource", server.uri()))
+            .with_fuel_page_limit(50_000);
+        let rows = client.fetch_fuel_range("AA001A", "ZZ999Z").await.unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    /// Criterion 1, edge case: the fuel range boundary between two pages
+    /// falls in the middle of one kenteken's volgnummer group (AA001A has 3
+    /// entries but the first page ends after its 2nd). The cursor must
+    /// resume with AA001A's 3rd entry rather than skipping or duplicating
+    /// it, so the concatenated result never splits a group incorrectly.
+    #[tokio::test]
+    async fn fetch_fuel_range_edge_full_page_retries_the_trailing_group() {
+        let server = MockServer::start().await;
+        // Page 1 comes back at the full limit, so its trailing group (BB002B)
+        // may be cut in half and must be dropped, not kept.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![fuel_json("AA001A", 1), fuel_json("BB002B", 1)]),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Page 2 resumes INCLUSIVELY at BB002B and returns its complete group.
+        // It fills the page, so the client asks once more.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![fuel_json("BB002B", 1), fuel_json("BB002B", 2)]),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Page 3: nothing remains past BB002B, which ends the walk.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<Value>::new()))
+            .mount(&server)
+            .await;
+
+        let client = fast_client()
+            .with_resource_base(format!("{}/resource", server.uri()))
+            .with_fuel_page_limit(2);
+        let rows = client.fetch_fuel_range("AA001A", "ZZ999Z").await.unwrap();
+
+        // BB002B's whole group appears exactly once: the truncated copy from
+        // page 1 was dropped and the group re-fetched, not skipped or doubled.
+        let kentekens: Vec<_> = rows.iter().filter_map(|r| r.kenteken()).collect();
+        assert_eq!(kentekens, vec!["AA001A", "BB002B", "BB002B"]);
+    }
+
+    /// Criterion 1, failure/regression case: this is the exact live bug.
+    /// Two full-limit pages followed by a short page must all be fetched;
+    /// the previous implementation stopped after the first `$limit=50000`
+    /// request and silently discarded the rest.
+    #[tokio::test]
+    async fn fetch_fuel_range_regression_keeps_paging_until_short_page() {
+        let server = MockServer::start().await;
+
+        // Seven kentekens, one fuel row each, fetched three at a time. Each
+        // full page has its trailing group trimmed and re-requested
+        // inclusively, so the mock pages mirror what Socrata would return for
+        // those cursors.
+        let k: Vec<String> = (0..7).map(|i| format!("K{i:05}")).collect();
+        let page =
+            |names: &[&String]| -> Vec<Value> { names.iter().map(|n| fuel_json(n, 1)).collect() };
+
+        // Page 1: K0,K1,K2 (full) -> keep K0,K1, resume at >= K2.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(&[&k[0], &k[1], &k[2]])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Page 2 (>= K2): K2,K3,K4 (full) -> keep K2,K3, resume at >= K4.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(&[&k[2], &k[3], &k[4]])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Page 3 (>= K4): K4,K5,K6 (full) -> keep K4,K5, resume at >= K6.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(&[&k[4], &k[5], &k[6]])))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Page 4 (>= K6): K6 alone, short -> keep and stop.
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(page(&[&k[6]])))
+            .mount(&server)
+            .await;
+
+        let client = fast_client()
+            .with_resource_base(format!("{}/resource", server.uri()))
+            .with_fuel_page_limit(3);
+        let rows = client.fetch_fuel_range(&k[0], &k[6]).await.unwrap();
+
+        let got: Vec<&str> = rows.iter().filter_map(|r| r.kenteken()).collect();
+        let want: Vec<&str> = k.iter().map(String::as_str).collect();
+        assert_eq!(
+            got, want,
+            "every kenteken must appear exactly once: no group dropped at a page boundary and none duplicated"
+        );
     }
 
     #[test]

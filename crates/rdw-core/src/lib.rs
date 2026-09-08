@@ -3,13 +3,15 @@
 //! caching. No HTTP framework or Socrata HTTP details live here.
 
 pub mod csv_writer;
+pub mod failure;
 pub mod merge;
 pub mod metadata;
 pub mod rate_limit;
 pub mod widen;
 
 pub use csv_writer::{assemble, cleanup, Assembled, Assembler, EXCEL_MAX_DATA_ROWS};
-pub use merge::{merge_join, MergeJoinError, WidenedRow, MAX_FUEL_ENTRIES};
+pub use failure::{FailedRange, FailureConfig, FuelFailureSummary};
+pub use merge::{merge_join, ExportStatus, MergeJoinError, WidenedRow, MAX_FUEL_ENTRIES};
 pub use metadata::{
     fallback_fuel_columns, fallback_vehicle_columns, load_column_metadata, ColumnMetadata,
 };
