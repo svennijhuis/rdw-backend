@@ -7,11 +7,6 @@
       "runtime": "container"
     }
   },
-  "functions": {
-    "**": {
-      "maxDuration": 800
-    }
-  },
   "rewrites": [
     { "source": "/(.*)", "destination": { "service": "api" } }
   ]
