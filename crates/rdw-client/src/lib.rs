@@ -115,6 +115,7 @@ pub struct RdwClient {
     metadata_base: String,
     retry_config: RetryConfig,
     fuel_page_limit: u32,
+    fuel_concurrency: usize,
 }
 
 const DEFAULT_METADATA_BASE: &str = "https://opendata.rdw.nl/api/views";
@@ -125,6 +126,19 @@ const DEFAULT_METADATA_BASE: &str = "https://opendata.rdw.nl/api/views";
 /// in about 0.4s, while 2,000 is rejected with HTTP 414 Request-URI Too Large.
 /// 800 keeps clear headroom under that ceiling.
 pub const FUEL_KENTEKEN_BATCH: usize = 800;
+
+/// How many fuel batches are in flight at once.
+///
+/// The batches are independent, so this is close to a linear speed-up on the
+/// part of an export that dominates its runtime. It is capped because Socrata
+/// throttles, and an unauthenticated caller harder still, so past some point
+/// extra concurrency buys contention rather than rows.
+///
+/// Measured on a full Lexus export (31,512 vehicles) against opendata.rdw.nl:
+/// 1 -> 30.4s, 8 -> 12.9s, 16 -> 7.7s, 24 -> 7.7s, 32 -> 14.9s. Sixteen is the
+/// knee of that curve: 24 gains nothing and 32 is worse than 8. Override with
+/// `FUEL_CONCURRENCY`.
+pub const DEFAULT_FUEL_CONCURRENCY: usize = 16;
 
 impl RdwClient {
     pub fn new(app_token: Option<String>) -> Self {
@@ -139,6 +153,7 @@ impl RdwClient {
             metadata_base: DEFAULT_METADATA_BASE.to_string(),
             retry_config: RetryConfig::default(),
             fuel_page_limit: DEFAULT_FUEL_PAGE_LIMIT,
+            fuel_concurrency: DEFAULT_FUEL_CONCURRENCY,
         }
     }
 
@@ -169,6 +184,13 @@ impl RdwClient {
     /// always uses `DEFAULT_FUEL_PAGE_LIMIT`, matching Socrata's cap.
     pub fn with_fuel_page_limit(mut self, limit: u32) -> Self {
         self.fuel_page_limit = limit;
+        self
+    }
+
+    /// Override how many fuel batches are fetched concurrently. A value of 0 is
+    /// treated as 1, since a stream buffered at 0 would never make progress.
+    pub fn with_fuel_concurrency(mut self, concurrency: usize) -> Self {
+        self.fuel_concurrency = concurrency.max(1);
         self
     }
 
@@ -254,23 +276,36 @@ impl RdwClient {
         &self,
         kentekens: &[String],
     ) -> Result<Vec<FuelRow>, ClientError> {
-        let mut all: Vec<FuelRow> = Vec::new();
+        use futures::stream::{StreamExt, TryStreamExt};
 
-        for batch in kentekens.chunks(FUEL_KENTEKEN_BATCH) {
-            let url = self.fuel_by_kentekens_url(batch);
-            let rows: Vec<FuelRow> = self
-                .get_json_array(&url)
-                .await?
-                .into_iter()
-                .map(FuelRow)
-                .collect();
-            all.extend(rows);
-        }
+        // Batches are independent, so they are fetched concurrently. `buffered`
+        // rather than `buffer_unordered`: results must stay in the order the
+        // batches were issued, because the plates arrive kenteken-sorted and
+        // `merge_join` relies on the concatenated fuel rows being sorted too.
+        //
+        // Concurrency is capped rather than unbounded. Socrata throttles, and
+        // an unauthenticated caller is throttled harder, so firing hundreds of
+        // requests at once buys 429s and retries instead of speed.
+        let urls: Vec<String> = kentekens
+            .chunks(FUEL_KENTEKEN_BATCH)
+            .map(|batch| self.fuel_by_kentekens_url(batch))
+            .collect();
 
-        // Batches are taken from an already kenteken-sorted slice and each
-        // response is ordered, so the concatenation is globally ordered, which
-        // is what merge_join requires.
-        Ok(all)
+        let pages: Vec<Vec<FuelRow>> = futures::stream::iter(urls)
+            .map(|url| async move {
+                let rows: Vec<FuelRow> = self
+                    .get_json_array(&url)
+                    .await?
+                    .into_iter()
+                    .map(FuelRow)
+                    .collect();
+                Ok::<_, ClientError>(rows)
+            })
+            .buffered(self.fuel_concurrency)
+            .try_collect()
+            .await?;
+
+        Ok(pages.into_iter().flatten().collect())
     }
 
     /// Fetch and parse the RDW dataset metadata used for CSV column headers.
@@ -625,6 +660,45 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             3,
             "plates must be split into ceil(2N+1 / N) = 3 requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_fuel_for_kentekens_keeps_batch_order_when_fetched_concurrently() {
+        // Concurrency must not reorder results: merge_join requires the fuel
+        // rows to arrive kenteken-sorted, and the plates are handed in sorted,
+        // so batch N's rows must still precede batch N+1's. A slow first batch
+        // would overtake under buffer_unordered.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![fuel_json("AA001A", 1)])
+                    .set_delay(std::time::Duration::from_millis(120)),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![fuel_json("ZZ999Z", 1)]))
+            .mount(&server)
+            .await;
+
+        let client = fast_client()
+            .with_resource_base(format!("{}/resource", server.uri()))
+            .with_fuel_concurrency(8);
+        let plates: Vec<String> = (0..FUEL_KENTEKEN_BATCH + 1)
+            .map(|i| format!("K{i:05}"))
+            .collect();
+        let rows = client.fetch_fuel_for_kentekens(&plates).await.unwrap();
+
+        let order: Vec<_> = rows.iter().filter_map(|r| r.kenteken()).collect();
+        assert_eq!(
+            order,
+            vec!["AA001A", "ZZ999Z"],
+            "the slow first batch must still come first"
         );
     }
 

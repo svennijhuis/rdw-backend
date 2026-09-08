@@ -30,7 +30,12 @@ async fn main() {
         tracing::warn!("VALID_API_KEYS is empty; every request will be rejected with 401");
     }
 
-    let client = RdwClient::new(app_token);
+    let fuel_concurrency: usize = std::env::var("FUEL_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(rdw_client::DEFAULT_FUEL_CONCURRENCY);
+
+    let client = RdwClient::new(app_token).with_fuel_concurrency(fuel_concurrency);
     let metadata = load_column_metadata(&client).await;
     if metadata.used_fallback {
         tracing::warn!(

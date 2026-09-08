@@ -108,6 +108,7 @@ docker build -t rdw-api . && docker run -p 3000:3000 -e VALID_API_KEYS="some-key
 | `RDW_APP_TOKEN` | no | — | Socrata app token. Without it RDW's unauthenticated rate tier applies. |
 | `FUEL_FAILURE_FLOOR` | no | 3 | Fuel fetch failures tolerated regardless of export size. |
 | `FUEL_FAILURE_RATIO` | no | 0.10 | Additional proportional allowance on large exports. |
+| `FUEL_CONCURRENCY` | no | 16 | Fuel batches fetched at once. Past ~16 RDW throttling dominates. |
 | `PORT` / `SERVER_PORT` | no | 3000 | Listen port. `PORT` wins; hosts usually inject it. |
 | `RUST_LOG` | no | — | Log filter, e.g. `info` or `rdw_api=debug`. |
 
@@ -136,12 +137,18 @@ Asking for a brand without a `limit` works and is the intended use. Measured end
 
 | Export | Vehicles | On disk | Over the wire (gzip) | Time |
 |---|---|---|---|---|
-| Lexus | 31,512 | 29 MB | 2.6 MB | 25s |
+| Lexus | 31,512 | 29 MB | 2.6 MB | 8s |
+| Toyota | 824,620 | 736 MB | 63 MB | 237s |
 
 Two things make that possible. Responses are **streamed from disk**, so neither the service nor the
 host has to hold the file in memory, and a streamed body is not subject to the 4.5MB cap that hosts
 such as Vercel apply to buffered responses. Responses are also **gzipped**, and this CSV compresses
 about 13x, which is most of the transfer time and most of the bandwidth bill.
+
+Fuel batches are fetched concurrently, `FUEL_CONCURRENCY` at a time, in issue order so the rows stay
+kenteken-sorted for the join. Measured on a full Lexus export: 1 -> 30.4s, 8 -> 12.9s, 16 -> 7.7s,
+24 -> 7.7s, 32 -> 14.9s. Sixteen is the knee; past it Socrata throttling costs more than the extra
+parallelism gains.
 
 Fuel rows are fetched by naming the plates, not by kenteken range. A brand's plates are scattered
 across the whole kenteken space — every Lexus lies between `00GDF5` and `ZV939H`, a range holding
