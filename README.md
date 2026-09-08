@@ -130,9 +130,25 @@ Tests mock every RDW call, which keeps them fast and offline but means they cann
 query — a mock answers anything. Two bugs got through exactly that way. **Run a real request against
 RDW before trusting a change to the query layer.**
 
-## Known limits
+## Whole-brand exports
 
-- **Vercel caps a response at roughly 4.5MB**, about 5,000 rows here. Full exports need Docker.
+Asking for a brand without a `limit` works and is the intended use. Measured end to end:
+
+| Export | Vehicles | On disk | Over the wire (gzip) | Time |
+|---|---|---|---|---|
+| Lexus | 31,512 | 29 MB | 2.6 MB | 25s |
+
+Two things make that possible. Responses are **streamed from disk**, so neither the service nor the
+host has to hold the file in memory, and a streamed body is not subject to the 4.5MB cap that hosts
+such as Vercel apply to buffered responses. Responses are also **gzipped**, and this CSV compresses
+about 13x, which is most of the transfer time and most of the bandwidth bill.
+
+Fuel rows are fetched by naming the plates, not by kenteken range. A brand's plates are scattered
+across the whole kenteken space — every Lexus lies between `00GDF5` and `ZV939H`, a range holding
+16,962,192 of the dataset's 16,966,705 fuel rows — so a range query walked almost the entire dataset
+to find a few thousand cars. Naming plates in batches fetches only what the export needs.
+
+## Known limits
 - **Only three brands.** Anything else is rejected with 400, by design.
 - **`api_key` in the URL is visible** in logs, proxies and browser history. Prefer `X-Api-Key`.
 - **RDW's data is the source of truth.** Blank cells usually mean RDW holds no value; Socrata omits

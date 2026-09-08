@@ -97,19 +97,19 @@ pub async fn fetch_and_widen(
             break;
         }
 
-        let lo = page
-            .first()
-            .and_then(|v| v.kenteken())
-            .unwrap_or_default()
-            .to_string();
-        let hi = page
-            .last()
-            .and_then(|v| v.kenteken())
-            .unwrap_or_default()
-            .to_string();
+        // Ask for exactly this page's plates. A brand's kentekens are spread
+        // across the whole kenteken space, so a range query would drag in
+        // nearly the entire fuel dataset to find them.
+        let kentekens: Vec<String> = page
+            .iter()
+            .filter_map(|v| v.kenteken())
+            .map(str::to_string)
+            .collect();
+        let lo = kentekens.first().cloned().unwrap_or_default();
+        let hi = kentekens.last().cloned().unwrap_or_default();
 
         summary.attempted += 1;
-        let (fuel, fuel_fetch_failed) = match client.fetch_fuel_range(&lo, &hi).await {
+        let (fuel, fuel_fetch_failed) = match client.fetch_fuel_for_kentekens(&kentekens).await {
             Ok(rows) => (rows, false),
             Err(err) => {
                 tracing::warn!(

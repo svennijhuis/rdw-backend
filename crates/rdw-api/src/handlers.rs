@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::body::Body;
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -152,11 +153,13 @@ async fn run(
     // Reading the staged file back can still fail, and that is a 502 like any
     // other upstream failure, so it must release quota on the same terms
     // rather than charging the caller for an export they never received.
-    let response = build_response(&assembled, &summary).inspect_err(|_| {
+    // build_response unlinks the staged file as soon as it has a handle open,
+    // so there is no separate cleanup step on the success path. On the error
+    // path the file still exists and must be removed here.
+    build_response(&assembled, &summary).inspect_err(|_| {
         state.rate_limiter.release(&rate_key, now);
-    });
-    rdw_core::cleanup(&assembled);
-    response
+        rdw_core::cleanup(&assembled);
+    })
 }
 
 fn pipeline_error_to_api_error(err: &PipelineError) -> ApiError {
@@ -185,8 +188,36 @@ fn build_response(
     assembled: &Assembled,
     summary: &FuelFailureSummary,
 ) -> Result<Response, ApiError> {
-    let bytes = std::fs::read(assembled.path())
-        .map_err(|e| ApiError::BadGateway(format!("failed to read export file: {e}")))?;
+    // Stream the staged file rather than reading it into memory. A full brand
+    // export is hundreds of megabytes, so buffering it would both blow up
+    // memory and hit the 4.5MB response cap that hosts such as Vercel apply to
+    // non-streamed bodies; a streamed body has no such cap.
+    //
+    // The never-partial guarantee is unaffected: the file is already complete
+    // and closed before this function is called, so streaming only changes how
+    // finished bytes reach the client.
+    let file = std::fs::File::open(assembled.path())
+        .map_err(|e| ApiError::BadGateway(format!("failed to open export file: {e}")))?;
+    let len = file
+        .metadata()
+        .map_err(|e| ApiError::BadGateway(format!("failed to stat export file: {e}")))?
+        .len();
+
+    // Unlink the path now that the handle is open. On Unix the data stays
+    // readable through this descriptor until it is dropped, so the temp file
+    // cannot be left behind even if the client disconnects mid-download.
+    if let Err(e) = std::fs::remove_file(assembled.path()) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %assembled.path().display(),
+                error = %e,
+                "failed to unlink temp export file before streaming"
+            );
+        }
+    }
+
+    let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
+    let body = Body::from_stream(stream);
 
     let (content_type, extension) = match assembled {
         Assembled::Csv { .. } => ("text/csv", "csv"),
@@ -201,10 +232,7 @@ fn build_response(
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(
-        header::CONTENT_LENGTH,
-        HeaderValue::from(bytes.len() as u64),
-    );
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
@@ -218,7 +246,7 @@ fn build_response(
         }
     }
 
-    Ok((StatusCode::OK, headers, bytes).into_response())
+    Ok((StatusCode::OK, headers, body).into_response())
 }
 
 fn seconds_until_next_day(now_unix: i64) -> u64 {
