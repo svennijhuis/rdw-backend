@@ -8,7 +8,7 @@ Three crates, `[workspace.dependencies]` pinned at the root `Cargo.toml`:
   building, retry-with-backoff, `VehicleRow`/`FuelRow` (raw JSON objects, no hardcoded 98/36-column
   structs), and column-metadata fetching.
 - `crates/rdw-core` — business logic with no HTTP framework or Socrata HTTP details: merge-join of
-  sorted vehicle/fuel cursors, row widening (`fuel1_*`, `fuel2_*`, `fuel3_*`), CSV/ZIP assembly with
+  sorted vehicle/fuel cursors, row widening (`Brandstof 1 - *`, `Brandstof 2 - *`, `Brandstof 3 - *`), CSV/ZIP assembly with
   the Excel row-limit split, the fixed-window rate limiter, and column-metadata fallback.
 - `crates/rdw-api` — Axum web service: the `GET /api/v1/fuel` route, query/API-key extraction,
   Accept-header-aware error rendering, the fetch/merge/widen pipeline orchestration, and the

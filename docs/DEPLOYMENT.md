@@ -34,15 +34,42 @@ curl -v -H "Accept: text/html" "http://localhost:3000/api/v1/fuel?brands=ford&ap
 Local/Docker has no response-size or execution-duration limit, so it is the supported path for a
 full, unrestricted export.
 
-## Vercel (optional; setup and local test only, per this plan's scope)
+## Vercel
 
-1. Push the repository to GitHub.
-2. Link the GitHub repository to a Vercel project.
-3. Set `VALID_API_KEYS` and `RDW_APP_TOKEN` in the Vercel dashboard's environment variables.
-4. Deploy with `vercel deploy --prod`.
-5. Test only a small export, e.g. `?limit=1000`, to stay within Vercel's constraints.
+The project deploys to Vercel's **container** runtime: `vercel.json` declares a service whose
+entrypoint is this repository's `Dockerfile`, and every request is rewritten to it. Vercel builds
+that image, stores it in its own registry, and serves it from a function that scales to zero when
+idle.
 
-**Known limitation:** Vercel Functions cap non-streamed response bodies at roughly 4.5MB and enforce
-an execution-duration limit. A full, unrestricted `/api/v1/fuel` export exceeds both and will fail
-on Vercel. Use local Docker for production-scale exports; Vercel is suitable only for small, capped
-requests.
+```bash
+vercel deploy --prod
+```
+
+Pushing to `main` on the connected GitHub repository deploys as well.
+
+Environment variables are set with the CLI (or the dashboard):
+
+```bash
+vercel env add VALID_API_KEYS production
+vercel env add RDW_APP_TOKEN production      # optional
+vercel env add FUEL_FAILURE_FLOOR production # optional, default 3
+vercel env add FUEL_FAILURE_RATIO production # optional, default 0.10
+```
+
+### Deploying requires a running Docker daemon
+
+The container image is built **on the machine running `vercel deploy`**, not on Vercel's builders.
+With Docker stopped, the deploy produces no image and the deployment sits in `UNKNOWN` with a 0ms
+build and no build logs — a confusing failure with no obvious cause. Start Docker Desktop first and
+confirm with `docker info`.
+
+`.vercelignore` must keep `target/` out of the upload. After a release build that directory reaches
+several GB and will stall the deploy at the upload step; the image is built from source inside the
+Dockerfile, so no local artifact needs uploading.
+
+### Size limit on Vercel
+
+Vercel Functions cap a non-streamed response body at roughly 4.5MB. Measured against this service,
+**about 5,000 rows produces 4.2MB**, so that is the practical ceiling there; larger exports fail.
+Local or self-hosted Docker has no such cap and is the supported path for a full, unrestricted
+export.
