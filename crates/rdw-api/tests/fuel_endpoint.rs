@@ -792,3 +792,60 @@ async fn edge_accept_html_error_renders_html_page() {
     let body = body_string(response).await;
     assert!(body.starts_with("<!DOCTYPE html>"));
 }
+
+/// Performance regression guard: a small `?limit=` must not make the service
+/// request a full 50,000-vehicle page. It previously did, then fetched every
+/// fuel row in that page's kenteken range, so `?limit=200` moved hundreds of
+/// thousands of rows to return 200 and took about 31 seconds in production.
+/// The vehicle page must be requested at the size the caller can actually use.
+#[tokio::test]
+async fn small_limit_requests_a_small_vehicle_page_not_the_full_50000() {
+    let server = MockServer::start().await;
+    mount_vehicle_page(
+        &server,
+        json!([{ "kenteken": "AA001A", "merk": "TOYOTA" }, { "kenteken": "AA002B", "merk": "TOYOTA" }]),
+    )
+    .await;
+    mount_fuel_range(
+        &server,
+        json!([{ "kenteken": "AA001A", "brandstof_volgnummer": "1", "brandstof_omschrijving": "Benzine" }]),
+    )
+    .await;
+
+    let app = build_app(&server).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/fuel?brands=toyota&limit=2&api_key={API_KEY}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let vehicle_requests: Vec<_> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.url.path().contains("m9d7-ebf2"))
+        .collect();
+    assert!(
+        !vehicle_requests.is_empty(),
+        "the vehicle dataset must have been queried"
+    );
+    for request in &vehicle_requests {
+        let url = request.url.as_str();
+        assert!(
+            url.contains("limit=2") || url.contains("limit%3D2") || url.contains("%242limit"),
+            "vehicle page must be requested at the caller's limit, not 50000; got: {url}"
+        );
+        assert!(
+            !url.contains("50000"),
+            "a limit=2 export must never request a 50,000-row vehicle page; got: {url}"
+        );
+    }
+}

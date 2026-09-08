@@ -74,8 +74,24 @@ pub async fn fetch_and_widen(
     let mut summary = FuelFailureSummary::default();
 
     loop {
+        // Ask for no more vehicles than the caller can still use. Without this
+        // a `?limit=200` request fetched a full 50,000-vehicle page and then
+        // every fuel row in that page's kenteken range — hundreds of thousands
+        // of rows over a dozen RDW calls — only to emit 200 rows and stop. The
+        // page size is the remaining limit, so a small export stays small.
+        let page_size = match limit {
+            Some(lim) => {
+                let remaining = lim.saturating_sub(produced);
+                if remaining == 0 {
+                    break;
+                }
+                remaining.min(VEHICLE_PAGE_LIMIT as u64) as u32
+            }
+            None => VEHICLE_PAGE_LIMIT,
+        };
+
         let page = client
-            .fetch_vehicle_page(merken, cursor.as_deref(), VEHICLE_PAGE_LIMIT)
+            .fetch_vehicle_page(merken, cursor.as_deref(), page_size)
             .await?;
         if page.is_empty() {
             break;
@@ -143,9 +159,12 @@ pub async fn fetch_and_widen(
             return Ok(summary);
         }
 
+        // A short page means the brand filter is exhausted. Compare against the
+        // size actually requested, not the constant, or a limit-shrunk page
+        // would be mistaken for the end of the data.
         let page_len = page.len() as u32;
         cursor = page.last().and_then(|v| v.kenteken()).map(str::to_string);
-        if page_len < VEHICLE_PAGE_LIMIT {
+        if page_len < page_size {
             break;
         }
     }
