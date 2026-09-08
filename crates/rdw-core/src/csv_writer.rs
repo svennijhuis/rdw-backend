@@ -346,7 +346,13 @@ fn build_report_text(summary: &FuelFailureSummary, generated_at_unix: i64) -> St
         text.push_str("All fuel data successfully fetched.\n\n");
     } else {
         text.push_str("Failed Ranges:\n");
-        for range in &summary.failed_ranges {
+        // Ranges are fetched concurrently (Scope C), so the order failures
+        // land in `summary.failed_ranges` is whichever range finished first,
+        // not kenteken order. Sort by `lo` so the report reads the same way
+        // regardless of fetch timing.
+        let mut sorted_ranges = summary.failed_ranges.clone();
+        sorted_ranges.sort_by(|a, b| a.lo.cmp(&b.lo));
+        for range in &sorted_ranges {
             text.push_str(&format!(
                 "- Range {} to {}: fetch failed, {} vehicles (at {})\n",
                 range.lo,
@@ -568,6 +574,50 @@ mod tests {
         assert!(report.contains("5000VH"));
         assert!(report.contains("47 vehicles"));
         assert!(report.contains("export_status"));
+        cleanup(&assembled);
+    }
+
+    /// With concurrent ranges (Scope C), `failed_ranges` arrives in whichever
+    /// order ranges finished, not kenteken order. The report must still list
+    /// them sorted by `lo`, or a reader trying to correlate the report
+    /// against the CSV's kenteken order gets a scrambled list.
+    #[test]
+    fn edge_failed_ranges_are_sorted_by_lo_regardless_of_arrival_order() {
+        let mut assembler = Assembler::new(header());
+        assembler
+            .write_rows(&rows(EXCEL_MAX_DATA_ROWS + 1))
+            .unwrap();
+        let failed_range = |lo: &str, hi: &str| crate::failure::FailedRange {
+            lo: lo.to_string(),
+            hi: hi.to_string(),
+            vehicle_count: 1,
+            failed_at_unix: 0,
+        };
+        // Deliberately out of kenteken order, as a concurrent fetch would
+        // produce: the range starting "9000VH" finished before "0001VH".
+        let summary = FuelFailureSummary {
+            attempted: 3,
+            failures: 3,
+            vehicles_affected: 3,
+            failed_ranges: vec![
+                failed_range("9000VH", "ZZZZZZ"),
+                failed_range("0001VH", "5000VH"),
+                failed_range("5000VH", "9000VH"),
+            ],
+        };
+        let assembled = assembler.finish_with_report(&summary).unwrap();
+        let path = match &assembled {
+            Assembled::Zip { path, .. } => path.clone(),
+            Assembled::Csv { .. } => panic!("expected a ZIP file"),
+        };
+        let report = zip_entry_text(&path, "_EXPORT_REPORT.txt");
+        let pos_0001 = report.find("0001VH").unwrap();
+        let pos_5000 = report.find("Range 5000VH").unwrap();
+        let pos_9000 = report.find("9000VH").unwrap();
+        assert!(
+            pos_0001 < pos_5000 && pos_5000 < pos_9000,
+            "ranges must be listed sorted by lo, got: {report}"
+        );
         cleanup(&assembled);
     }
 
