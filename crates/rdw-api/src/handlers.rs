@@ -149,7 +149,12 @@ async fn run(
         ApiError::BadGateway(format!("failed to assemble export: {e}"))
     })?;
 
-    let response = build_response(&assembled, &summary);
+    // Reading the staged file back can still fail, and that is a 502 like any
+    // other upstream failure, so it must release quota on the same terms
+    // rather than charging the caller for an export they never received.
+    let response = build_response(&assembled, &summary).inspect_err(|_| {
+        state.rate_limiter.release(&rate_key, now);
+    });
     rdw_core::cleanup(&assembled);
     response
 }

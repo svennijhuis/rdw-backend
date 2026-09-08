@@ -46,11 +46,14 @@ impl RowWidener {
         let mut header: Vec<String> = self
             .vehicle_columns
             .iter()
-            .map(|c| c.display.clone())
+            .map(|c| neutralize_formula(c.display.clone()))
             .collect();
         for slot in 1..=MAX_FUEL_ENTRIES {
             for col in &self.fuel_columns {
-                header.push(format!("Brandstof {slot} - {}", col.display));
+                header.push(neutralize_formula(format!(
+                    "Brandstof {slot} - {}",
+                    col.display
+                )));
             }
         }
         header.push(EXPORT_STATUS_HEADER.to_string());
@@ -78,10 +81,47 @@ impl RowWidener {
 }
 
 fn field_as_string(value: Option<&serde_json::Value>) -> String {
-    match value {
+    let raw = match value {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(other) => other.to_string(),
+    };
+    neutralize_formula(raw)
+}
+
+/// Stop a cell from being executed as a formula when the CSV is opened in a
+/// spreadsheet.
+///
+/// Every value here is third-party text from RDW, and this file exists to be
+/// opened in Excel, where a cell beginning `=`, `+`, `@`, or a control
+/// character is evaluated rather than displayed. Prefixing an apostrophe forces
+/// the cell to be read as text. The `csv` crate quotes delimiters correctly but
+/// does nothing about this, because it is a spreadsheet behaviour rather than a
+/// CSV one.
+///
+/// A leading `-` is deliberately treated differently. Blindly escaping it would
+/// turn every negative number in the dataset into text and quietly corrupt the
+/// export, so a `-` is only escaped when what follows is not a number.
+pub(crate) fn neutralize_formula(value: String) -> String {
+    let first = match value.chars().next() {
+        Some(c) => c,
+        None => return value,
+    };
+
+    let dangerous = match first {
+        '=' | '+' | '@' => true,
+        '\t' | '\r' => true,
+        '-' => value.parse::<f64>().is_err(),
+        _ => false,
+    };
+
+    if dangerous {
+        let mut out = String::with_capacity(value.len() + 1);
+        out.push('\'');
+        out.push_str(&value);
+        out
+    } else {
+        value
     }
 }
 
@@ -222,5 +262,69 @@ mod tests {
         // the status column distinguishes fetch failure from genuine
         // absence.
         assert_eq!(&row[2..8], ["", "", "", "", "", ""]);
+    }
+    #[test]
+    fn happy_path_ordinary_values_are_left_untouched() {
+        for v in ["Benzine", "TOYOTA", "00GBX4", "104", "1.5", ""] {
+            assert_eq!(neutralize_formula(v.to_string()), v);
+        }
+    }
+
+    #[test]
+    fn failure_formula_starting_values_are_neutralized() {
+        // A spreadsheet evaluates these; the apostrophe forces text.
+        for v in [
+            "=cmd|'/c calc'!A1",
+            "+1+1",
+            "@SUM(A1)",
+            "\tformula",
+            "\rformula",
+        ] {
+            let out = neutralize_formula(v.to_string());
+            assert!(out.starts_with('\''), "{v} must be escaped, got {out}");
+            assert!(
+                out.ends_with(v),
+                "the original value must be preserved after the quote"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_negative_numbers_are_not_escaped_but_negative_text_is() {
+        // Escaping every leading '-' would turn real negative measurements
+        // into text and corrupt the export.
+        for v in ["-5", "-0.5", "-1000"] {
+            assert_eq!(neutralize_formula(v.to_string()), v, "{v} is a number");
+        }
+        for v in ["-1+1", "-cmd", "-=1"] {
+            assert!(
+                neutralize_formula(v.to_string()).starts_with('\''),
+                "{v} is not a number and must be escaped"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_formula_in_a_data_value_reaches_the_csv_escaped() {
+        let widener = widener();
+        let vehicle = VehicleRow(
+            json!({ "kenteken": "AA001A", "merk": "=cmd|'/c calc'!A1" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let fuel = FuelRow(
+            json!({ "kenteken": "AA001A", "brandstof_volgnummer": "1", "brandstof_omschrijving": "Benzine" })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let rows = merge_join(&[vehicle], &[fuel], false).unwrap();
+        let widened = widener.widen(&rows[0]);
+        let merk = &widened[1];
+        assert!(
+            merk.starts_with('\''),
+            "a formula in RDW data must not reach the spreadsheet live: {merk}"
+        );
     }
 }

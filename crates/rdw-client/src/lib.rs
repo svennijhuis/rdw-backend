@@ -320,12 +320,21 @@ impl RdwClient {
                 .to_string();
 
             if first_kenteken == last_kenteken {
-                // The page holds a single kenteken, so trimming it would leave
-                // nothing and stall. Keep it and step strictly past it; one
-                // plate has at most a handful of fuel rows, far below any sane
-                // page limit, so this branch means the whole group is present.
-                all.extend(page);
-                cursor = Some((last_kenteken, false));
+                // A full page holding one kenteken means that plate's group may
+                // continue past the page boundary, and it cannot be resumed:
+                // stepping past the kenteken would drop the remainder, while
+                // re-requesting it inclusively would return this same page
+                // forever. Neither is acceptable when a silently short group
+                // would still be reported as a complete `ok` row, so fail.
+                //
+                // In RDW's data a plate carries at most three fuel rows against
+                // a 50,000-row page, so this is a guard against the data
+                // changing shape, not a path exercised in practice.
+                return Err(ClientError::Decode(format!(
+                    "kenteken {last_kenteken} filled an entire {} row fuel page; \
+                     its fuel group cannot be paged safely",
+                    self.fuel_page_limit
+                )));
             } else {
                 // A full page's trailing group may be cut in half. Drop it and
                 // re-request it INCLUSIVELY on the next page, so it is fetched
@@ -672,38 +681,32 @@ mod tests {
     #[tokio::test]
     async fn fetch_fuel_range_edge_full_page_retries_the_trailing_group() {
         let server = MockServer::start().await;
-        // Page 1 comes back at the full limit, so its trailing group (BB002B)
-        // may be cut in half and must be dropped, not kept.
+        // Page 1 comes back at the full limit of 3, so its trailing group
+        // (BB002B) may be cut in half and must be dropped, not kept.
         Mock::given(method("GET"))
             .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(vec![fuel_json("AA001A", 1), fuel_json("BB002B", 1)]),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+                fuel_json("AA001A", 1),
+                fuel_json("BB002B", 1),
+                fuel_json("BB002B", 2),
+            ]))
             .up_to_n_times(1)
             .mount(&server)
             .await;
         // Page 2 resumes INCLUSIVELY at BB002B and returns its complete group.
-        // It fills the page, so the client asks once more.
+        // Two rows is short of the limit, so the walk ends here.
         Mock::given(method("GET"))
             .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(vec![fuel_json("BB002B", 1), fuel_json("BB002B", 2)]),
             )
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
-        // Page 3: nothing remains past BB002B, which ends the walk.
-        Mock::given(method("GET"))
-            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(Vec::<Value>::new()))
             .mount(&server)
             .await;
 
         let client = fast_client()
             .with_resource_base(format!("{}/resource", server.uri()))
-            .with_fuel_page_limit(2);
+            .with_fuel_page_limit(3);
         let rows = client.fetch_fuel_range("AA001A", "ZZ999Z").await.unwrap();
 
         // BB002B's whole group appears exactly once: the truncated copy from
@@ -716,6 +719,37 @@ mod tests {
     /// Two full-limit pages followed by a short page must all be fetched;
     /// the previous implementation stopped after the first `$limit=50000`
     /// request and silently discarded the rest.
+    #[tokio::test]
+    async fn failure_single_kenteken_filling_a_whole_page_is_reported_not_truncated() {
+        // A full page containing only one kenteken means that plate's fuel
+        // group may continue past the boundary. Stepping past it would drop
+        // rows while still reporting the vehicle as `ok`, so the fetch must
+        // fail instead. Previously this branch kept the page and advanced,
+        // losing everything beyond the page limit silently.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/resource/{FUEL_DATASET_ID}.json")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(vec![fuel_json("AA001A", 1), fuel_json("AA001A", 2)]),
+            )
+            .mount(&server)
+            .await;
+
+        let client = fast_client()
+            .with_resource_base(format!("{}/resource", server.uri()))
+            .with_fuel_page_limit(2);
+        let err = client
+            .fetch_fuel_range("AA001A", "ZZ999Z")
+            .await
+            .expect_err("a single kenteken filling the page must not be silently truncated");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AA001A"),
+            "the error must name the offending kenteken, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_fuel_range_regression_keeps_paging_until_short_page() {
         let server = MockServer::start().await;
