@@ -87,7 +87,7 @@ pub fn assemble(header: &[String], rows: &[Vec<String>]) -> io::Result<Assembled
 /// many data rows have been written to it so far.
 struct Part {
     path: PathBuf,
-    writer: csv::Writer<File>,
+    writer: csv::Writer<flate2::write::GzEncoder<File>>,
     row_count: usize,
 }
 
@@ -116,8 +116,14 @@ impl Assembler {
 
     fn open_new_part(&mut self) -> io::Result<()> {
         let path = unique_temp_path(".part.csv");
+        // Parts are written gzip-compressed. This CSV compresses about 13x,
+        // and the staging directory on a serverless host is small: Vercel gives
+        // a function 500MB of writable /tmp, while a full Toyota export is
+        // 736MB uncompressed and crashed the container. Compressed it is 63MB.
+        // Compressing once here also avoids compressing again per response.
         let file = File::create(&path)?;
-        let mut writer = csv::WriterBuilder::new().from_writer(file);
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut writer = csv::WriterBuilder::new().from_writer(encoder);
         writer.write_record(&self.header)?;
         self.current = Some(Part {
             path,
@@ -130,7 +136,14 @@ impl Assembler {
     fn close_current_part(&mut self) -> io::Result<()> {
         if let Some(mut part) = self.current.take() {
             part.writer.flush()?;
-            drop(part.writer);
+            // Finish the gzip stream explicitly: dropping the encoder would
+            // swallow a write error and could leave a truncated member, which
+            // is exactly the silently-corrupt file this export must never
+            // produce.
+            part.writer
+                .into_inner()
+                .map_err(io::Error::other)?
+                .finish()?;
             self.part_paths.push(part.path);
         }
         Ok(())
@@ -245,8 +258,13 @@ impl Assembler {
             let part_name = format!("part-{}.csv", idx + 1);
             zip.start_file(part_name, options)
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            let mut part_file = File::open(part_path)?;
-            io::copy(&mut part_file, &mut zip)?;
+            // Parts are staged gzip-compressed to survive a small /tmp, so
+            // they are expanded back to plain CSV on the way into the archive;
+            // the ZIP applies its own deflate. Streaming the decode keeps this
+            // bounded no matter how large the part is.
+            let part_file = File::open(part_path)?;
+            let mut decoder = flate2::read::GzDecoder::new(part_file);
+            io::copy(&mut decoder, &mut zip)?;
         }
         if let Some(text) = report_text {
             zip.start_file("_EXPORT_REPORT.txt", options)
@@ -349,6 +367,16 @@ fn build_report_text(summary: &FuelFailureSummary, generated_at_unix: i64) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Read a staged part back as plain text. Parts are written gzip-compressed
+    /// so a large export fits the small writable /tmp a serverless host gives.
+    fn read_gzipped(path: &std::path::Path) -> String {
+        let mut out = String::new();
+        flate2::read::GzDecoder::new(File::open(path).unwrap())
+            .read_to_string(&mut out)
+            .unwrap();
+        out
+    }
+
     use std::io::Read;
 
     fn header() -> Vec<String> {
@@ -370,11 +398,9 @@ mod tests {
                 content_length,
             } => {
                 assert!(*content_length > 0);
-                let mut contents = String::new();
-                File::open(path)
-                    .unwrap()
-                    .read_to_string(&mut contents)
-                    .unwrap();
+                // Parts are staged gzip-compressed, so read them back through
+                // the decoder the response path uses.
+                let contents = read_gzipped(path);
                 assert_eq!(contents.lines().count(), 4); // header + 3 rows
             }
             Assembled::Zip { .. } => panic!("expected a single CSV file"),
@@ -440,11 +466,7 @@ mod tests {
         let assembled = assembler.finish().unwrap();
         match &assembled {
             Assembled::Csv { path, .. } => {
-                let mut contents = String::new();
-                File::open(path)
-                    .unwrap()
-                    .read_to_string(&mut contents)
-                    .unwrap();
+                let contents = read_gzipped(path);
                 assert_eq!(contents.lines().count(), 2_501); // header + 2500 rows
             }
             Assembled::Zip { .. } => panic!("expected a single CSV file"),

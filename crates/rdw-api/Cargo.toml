@@ -20,6 +20,7 @@ axum = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true, features = ["trace", "compression-gzip"] }
 tokio-util = { workspace = true, features = ["io"] }
+async-compression = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

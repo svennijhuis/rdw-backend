@@ -156,7 +156,14 @@ async fn run(
     // build_response unlinks the staged file as soon as it has a handle open,
     // so there is no separate cleanup step on the success path. On the error
     // path the file still exists and must be removed here.
-    build_response(&assembled, &summary).inspect_err(|_| {
+    // The staged CSV is gzip-compressed on disk. A client that advertises gzip
+    // gets those bytes as they are; anything else gets them expanded on the fly.
+    let accepts_gzip = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"));
+
+    build_response(&assembled, &summary, accepts_gzip).inspect_err(|_| {
         state.rate_limiter.release(&rate_key, now);
         rdw_core::cleanup(&assembled);
     })
@@ -187,15 +194,8 @@ fn pipeline_error_to_api_error(err: &PipelineError) -> ApiError {
 fn build_response(
     assembled: &Assembled,
     summary: &FuelFailureSummary,
+    accepts_gzip: bool,
 ) -> Result<Response, ApiError> {
-    // Stream the staged file rather than reading it into memory. A full brand
-    // export is hundreds of megabytes, so buffering it would both blow up
-    // memory and hit the 4.5MB response cap that hosts such as Vercel apply to
-    // non-streamed bodies; a streamed body has no such cap.
-    //
-    // The never-partial guarantee is unaffected: the file is already complete
-    // and closed before this function is called, so streaming only changes how
-    // finished bytes reach the client.
     let file = std::fs::File::open(assembled.path())
         .map_err(|e| ApiError::BadGateway(format!("failed to open export file: {e}")))?;
     let len = file
@@ -203,9 +203,9 @@ fn build_response(
         .map_err(|e| ApiError::BadGateway(format!("failed to stat export file: {e}")))?
         .len();
 
-    // Unlink the path now that the handle is open. On Unix the data stays
-    // readable through this descriptor until it is dropped, so the temp file
-    // cannot be left behind even if the client disconnects mid-download.
+    // Unlink now that the handle is open. On Unix the data stays readable
+    // through this descriptor until it is dropped, so the staged file cannot be
+    // left behind even if the client disconnects mid-download.
     if let Err(e) = std::fs::remove_file(assembled.path()) {
         if e.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -215,9 +215,6 @@ fn build_response(
             );
         }
     }
-
-    let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
-    let body = Body::from_stream(stream);
 
     let (content_type, extension) = match assembled {
         Assembled::Csv { .. } => ("text/csv", "csv"),
@@ -232,7 +229,6 @@ fn build_response(
 
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
     if let Ok(value) = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\"")) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
@@ -245,6 +241,25 @@ fn build_response(
             headers.insert(HeaderName::from_static(EXPORT_WARNINGS_HEADER), hv);
         }
     }
+
+    let async_file = tokio::fs::File::from_std(file);
+    let csv_is_gzipped = matches!(assembled, Assembled::Csv { .. });
+
+    let body = if csv_is_gzipped && !accepts_gzip {
+        // The CSV is staged compressed, so a client that cannot accept gzip
+        // gets it expanded on the way out. The length is unknown up front, so
+        // the response is chunked rather than carrying a wrong Content-Length.
+        let decoded = async_compression::tokio::bufread::GzipDecoder::new(
+            tokio::io::BufReader::new(async_file),
+        );
+        Body::from_stream(tokio_util::io::ReaderStream::new(decoded))
+    } else {
+        if csv_is_gzipped {
+            headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+        Body::from_stream(tokio_util::io::ReaderStream::new(async_file))
+    };
 
     Ok((StatusCode::OK, headers, body).into_response())
 }

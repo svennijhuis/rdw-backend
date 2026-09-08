@@ -1388,6 +1388,7 @@ dependencies = [
 name = "rdw-api"
 version = "0.1.0"
 dependencies = [
+ "async-compression",
  "axum",
  "http-body-util",
  "rdw-client",
@@ -1428,6 +1429,7 @@ version = "0.1.0"
 dependencies = [
  "csv",
  "dashmap",
+ "flate2",
  "rdw-client",
  "serde_json",
  "thiserror 1.0.69",

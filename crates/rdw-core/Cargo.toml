@@ -14,6 +14,8 @@ dashmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
+flate2 = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 wiremock = { workspace = true }
