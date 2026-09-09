@@ -22,7 +22,7 @@ pub enum ExportStatus {
     /// rows in the fuel dataset (a common, legitimate orphan case).
     NoFuelData,
     /// The fuel range fetch for this vehicle's kenteken range failed after
-    /// exhausting retries; fuel1_*/fuel2_*/fuel3_* are blank, not because
+    /// exhausting retries; the joined `Brandstof` cell is blank, not because
     /// the vehicle has no fuel data, but because it could not be fetched.
     FuelUnavailable,
 }

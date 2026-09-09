@@ -421,24 +421,41 @@ mod tests {
     }
 
     #[test]
-    fn fallback_columns_widen_to_full_204_column_header() {
-        // 98 vehicle columns + 3 fuel slots * 35 non-kenteken fuel columns
-        // + 1 export_status column (last position) = 204.
+    fn fallback_columns_widen_to_curated_vehicle_brandstof_and_status_header() {
         assert_eq!(fallback_vehicle_columns().len(), 98);
         assert_eq!(fallback_fuel_columns().len(), 36);
 
         let widener =
             crate::widen::RowWidener::new(fallback_vehicle_columns(), fallback_fuel_columns());
         let header = widener.header();
-        assert_eq!(header.len(), 98 + 3 * 35 + 1);
-        // Headers carry RDW's display names, not its fieldName keys.
-        assert_eq!(header[0], "Kenteken");
-        assert!(
-            header.contains(&"Gemiddelde Lading Waarde".to_string()),
-            "the fallback list must carry display names, not gem_lading_wrde"
+        assert_eq!(
+            header.len(),
+            crate::widen::VEHICLE_EXPORT_FIELDS.len() + 2,
+            "curated vehicle fields + Brandstof + Export status"
         );
-        assert!(header.iter().any(|h| h.starts_with("Brandstof 3 - ")));
+        assert_eq!(header[0], "Kenteken");
+        assert_eq!(header[1], "Merk");
+        assert_eq!(header[2], "Handelsbenaming");
+        // Display names, not fieldName keys, for a kept column whose labels differ.
+        assert!(
+            header.contains(&"Massa ledig voertuig".to_string()),
+            "the fallback list must carry display names, not massa_ledig_voertuig"
+        );
+        assert_eq!(header[header.len() - 2], "Brandstof");
         assert_eq!(header.last().unwrap(), "Export status");
+        for noise in [
+            "API Gekentekende_voertuigen_brandstof",
+            "Vervaldatum APK DT",
+            "Oplegger geremd",
+            "Lengte voertuig maximum",
+            "Gemiddelde Lading Waarde",
+            "Brandstof 1 - Brandstof omschrijving",
+        ] {
+            assert!(
+                !header.iter().any(|h| h == noise),
+                "{noise} must not appear in the curated header"
+            );
+        }
     }
 
     #[tokio::test]

@@ -9,8 +9,9 @@ Three crates, `[workspace.dependencies]` pinned at the root `Cargo.toml`:
   `VehicleRow`/`FuelRow`, raw JSON-like objects, no hardcoded 98/36-column structs), and
   column-metadata fetching.
 - `crates/rdw-core` — business logic with no HTTP framework or Socrata HTTP details: merge-join of
-  sorted vehicle/fuel cursors, row widening (`Brandstof 1 - *`, `Brandstof 2 - *`, `Brandstof 3 - *`), CSV/ZIP assembly with
-  the Excel row-limit split, the fixed-window rate limiter, and column-metadata fallback.
+  sorted vehicle/fuel cursors, row widening (curated vehicle columns plus one `Brandstof` cell
+  joining every fuel type for the plate), CSV/ZIP assembly with the Excel row-limit split, the
+  fixed-window rate limiter, and column-metadata fallback.
 - `crates/rdw-api` — Axum web service: the `GET /api/v1/fuel` route, query/API-key extraction,
   Accept-header-aware error rendering, the fetch/merge/widen pipeline orchestration, and the
   single-export concurrency guard.
@@ -33,9 +34,10 @@ Three crates, `[workspace.dependencies]` pinned at the root `Cargo.toml`:
    a single export-wide failure counter/abort flag is shared across every range so a proportional
    fuel-failure threshold applies once, not once per range. Both vehicle and fuel data are fetched as
    gzip-compressed CSV (smaller than JSON on the wire), parsed by the response's own header row.
-5. The two sorted cursors are merge-joined: each vehicle row is widened with up to 3 fuel entries.
-   A 4th fuel entry, an out-of-order fuel sequence, or an unsorted cursor fails loudly (502), rather
-   than silently truncating or duplicating data.
+5. The two sorted cursors are merge-joined: each vehicle row keeps one output row, with up to 3
+   fuel types joined into a single `Brandstof` cell (`Benzine, Elektriciteit` for a hybrid). A 4th
+   fuel entry, an out-of-order fuel sequence, or an unsorted cursor fails loudly (502), rather than
+   silently truncating or duplicating data.
 6. Rows are assembled into a single CSV, or split into numbered `part-N.csv` files inside a ZIP once
    the row count exceeds Excel's 1,048,575-data-row limit. Assembly stages to a temp file and only
    returns success once every page has succeeded; on any failure, no partial CSV is ever sent and
