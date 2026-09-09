@@ -9,9 +9,9 @@ Three crates, `[workspace.dependencies]` pinned at the root `Cargo.toml`:
   `VehicleRow`/`FuelRow`, raw JSON-like objects, no hardcoded 98/36-column structs), and
   column-metadata fetching.
 - `crates/rdw-core` — business logic with no HTTP framework or Socrata HTTP details: merge-join of
-  sorted vehicle/fuel cursors, row widening (one `Brandstof` cell joining every fuel type for the
-  plate), CSV/ZIP assembly with the Excel row-limit split, the fixed-window rate limiter, and
-  column-metadata fallback.
+  sorted vehicle/fuel cursors, row widening (curated vehicle columns plus one `Brandstof` cell
+  joining every fuel type for the plate), CSV/ZIP assembly with the Excel row-limit split, the
+  fixed-window rate limiter, and column-metadata fallback.
 - `crates/rdw-api` — Axum web service: the `GET /api/v1/fuel` route, query/API-key extraction,
   Accept-header-aware error rendering, the fetch/merge/widen pipeline orchestration, and the
   single-export concurrency guard.

@@ -43,11 +43,13 @@ Error bodies render as a small HTML page when the client prefers HTML, and as pl
 
 ## The CSV
 
-One row per vehicle: the 98 vehicle columns, then one `Brandstof` column, then an export-status
-column.
+One row per vehicle: a curated set of vehicle columns, then one `Brandstof` column, then an
+export-status column. The full RDW vehicle dataset has ~98 fields; the export keeps the ones that
+read well in a spreadsheet (identity, registration, size, type approval) and drops API link
+columns, duplicate `_dt` timestamps, trailer/hitch fields, and min/max dimension ranges.
 
 Vehicle headers use RDW's own display names rather than its internal field keys, so a column reads
-`Gemiddelde Lading Waarde`, not `gem_lading_wrde`. The Dutch names come from RDW and are not
+`Massa ledig voertuig`, not `massa_ledig_voertuig`. The Dutch names come from RDW and are not
 translated here.
 
 A vehicle can hold up to three fuel entries — a hybrid has two, for example petrol and electric.

@@ -4,6 +4,12 @@
 //! plate are joined into a single `Brandstof` column (e.g. a hybrid becomes
 //! `Benzine, Elektriciteit`) rather than repeating the vehicle or widening
 //! every fuel field into `Brandstof N - *` slots.
+//!
+//! Vehicle columns are filtered to [`VEHICLE_EXPORT_FIELDS`]: API URL
+//! columns, duplicate `_dt` timestamps, trailer/hitch fields and min/max
+//! dimension ranges are dropped so the spreadsheet stays readable.
+
+use std::collections::HashMap;
 
 use crate::merge::WidenedRow;
 use crate::metadata::Column;
@@ -22,6 +28,51 @@ const BRANDSTOF_OMSCHRIJVING_FIELD: &str = "brandstof_omschrijving";
 /// and electric therefore reads `Benzine, Elektriciteit`.
 const BRANDSTOF_SEPARATOR: &str = ", ";
 
+/// Vehicle fields kept in the CSV, in display order.
+///
+/// RDW's vehicle dataset has ~98 columns. Most of those are empty for a
+/// passenger car, duplicated as `_dt` timestamps, or are API link columns.
+/// This list is the readable subset: identity, registration, size, and type
+/// approval. A field that is absent from the metadata the caller passed in
+/// is skipped rather than emitting a blank header.
+pub const VEHICLE_EXPORT_FIELDS: &[&str] = &[
+    "kenteken",
+    "merk",
+    "handelsbenaming",
+    "voertuigsoort",
+    "inrichting",
+    "eerste_kleur",
+    "tweede_kleur",
+    "datum_eerste_toelating",
+    "datum_tenaamstelling",
+    "vervaldatum_apk",
+    "catalogusprijs",
+    "bruto_bpm",
+    "aantal_zitplaatsen",
+    "aantal_deuren",
+    "aantal_wielen",
+    "aantal_cilinders",
+    "cilinderinhoud",
+    "massa_ledig_voertuig",
+    "massa_rijklaar",
+    "toegestane_maximum_massa_voertuig",
+    "lengte",
+    "breedte",
+    "hoogte_voertuig",
+    "wielbasis",
+    "maximale_constructiesnelheid",
+    "europese_voertuigcategorie",
+    "type",
+    "variant",
+    "uitvoering",
+    "typegoedkeuringsnummer",
+    "zuinigheidsclassificatie",
+    "tellerstandoordeel",
+    "wam_verzekerd",
+    "export_indicator",
+    "taxi_indicator",
+];
+
 /// Column layout used to build the CSV header and to widen each row into
 /// exactly that column order.
 pub struct RowWidener {
@@ -29,11 +80,19 @@ pub struct RowWidener {
 }
 
 impl RowWidener {
-    /// `fuel_columns` is accepted so callers that already hold RDW fuel
-    /// metadata do not need a parallel constructor, but it is not emitted:
-    /// the CSV keeps a single joined `Brandstof` cell instead of one slot
-    /// per fuel-dataset field.
+    /// Keep only [`VEHICLE_EXPORT_FIELDS`], in that order. `fuel_columns` is
+    /// accepted so callers that already hold RDW fuel metadata do not need a
+    /// parallel constructor, but it is not emitted: the CSV keeps a single
+    /// joined `Brandstof` cell instead of one slot per fuel-dataset field.
     pub fn new(vehicle_columns: Vec<Column>, _fuel_columns: Vec<Column>) -> Self {
+        let by_field: HashMap<String, Column> = vehicle_columns
+            .into_iter()
+            .map(|c| (c.field.clone(), c))
+            .collect();
+        let vehicle_columns = VEHICLE_EXPORT_FIELDS
+            .iter()
+            .filter_map(|field| by_field.get(*field).cloned())
+            .collect();
         Self { vehicle_columns }
     }
 
@@ -177,6 +236,36 @@ mod tests {
         assert_eq!(
             header,
             vec!["Kenteken", "Merk", "Brandstof", "Export status"]
+        );
+    }
+
+    #[test]
+    fn header_drops_api_dt_and_trailer_columns_and_keeps_allowlist_order() {
+        // Input order is shuffled and includes columns the CSV must not show.
+        let widener = RowWidener::new(
+            vec![
+                Column::new(
+                    "api_gekentekende_voertuigen_brandstof",
+                    "API Gekentekende_voertuigen_brandstof",
+                ),
+                Column::new("vervaldatum_apk_dt", "Vervaldatum APK DT"),
+                Column::new("merk", "Merk"),
+                Column::new("oplegger_geremd", "Oplegger geremd"),
+                Column::new("handelsbenaming", "Handelsbenaming"),
+                Column::new("kenteken", "Kenteken"),
+                Column::new("lengte_voertuig_maximum", "Lengte voertuig maximum"),
+            ],
+            vec![],
+        );
+        assert_eq!(
+            widener.header(),
+            vec![
+                "Kenteken",
+                "Merk",
+                "Handelsbenaming",
+                "Brandstof",
+                "Export status",
+            ]
         );
     }
 
