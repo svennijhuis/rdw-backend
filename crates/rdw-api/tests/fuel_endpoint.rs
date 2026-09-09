@@ -195,8 +195,59 @@ async fn happy_path_valid_request_returns_csv() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers().get("content-type").unwrap(), "text/csv");
     let body = body_string(response).await;
-    assert!(body.contains("Kenteken,Merk"));
-    assert!(body.contains("AA001A,TOYOTA,1,Benzine"));
+    assert!(body.contains("Kenteken,Merk,Brandstof"));
+    assert!(
+        body.contains("AA001A,TOYOTA,Benzine"),
+        "a single fuel type fills Brandstof without a volgnummer slot: {body}"
+    );
+    assert!(
+        !body.contains("Brandstof 1 - "),
+        "the old per-slot fuel columns must not appear: {body}"
+    );
+}
+
+#[tokio::test]
+async fn happy_path_hybrid_joins_both_fuel_types_in_one_column() {
+    // A kenteken with two RDW fuel rows (Prius shape: petrol + electric)
+    // must stay one CSV row, with both types in Brandstof. The csv crate
+    // quotes the comma inside that cell.
+    let server = MockServer::start().await;
+    mount_vehicle_page(&server, json!([{ "kenteken": "00GBX4", "merk": "TOYOTA" }])).await;
+    mount_fuel_range(
+        &server,
+        json!([
+            { "kenteken": "00GBX4", "brandstof_volgnummer": "1", "brandstof_omschrijving": "Benzine" },
+            { "kenteken": "00GBX4", "brandstof_volgnummer": "2", "brandstof_omschrijving": "Elektriciteit" },
+        ]),
+    )
+    .await;
+
+    let app = build_app(&server).await;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fuel?brands=toyota&api_key={API_KEY}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    let data_rows: Vec<&str> = body
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with("Kenteken,"))
+        .collect();
+    assert_eq!(
+        data_rows.len(),
+        1,
+        "a hybrid must not be repeated across rows: {body}"
+    );
+    assert!(
+        body.contains("00GBX4,TOYOTA,\"Benzine, Elektriciteit\""),
+        "both fuel types belong in the one Brandstof cell: {body}"
+    );
 }
 
 #[tokio::test]

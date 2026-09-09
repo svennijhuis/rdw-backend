@@ -421,23 +421,28 @@ mod tests {
     }
 
     #[test]
-    fn fallback_columns_widen_to_full_204_column_header() {
-        // 98 vehicle columns + 3 fuel slots * 35 non-kenteken fuel columns
-        // + 1 export_status column (last position) = 204.
+    fn fallback_columns_widen_to_vehicle_brandstof_and_status_header() {
+        // 98 vehicle columns + 1 joined Brandstof column + 1 export_status.
         assert_eq!(fallback_vehicle_columns().len(), 98);
         assert_eq!(fallback_fuel_columns().len(), 36);
 
         let widener =
             crate::widen::RowWidener::new(fallback_vehicle_columns(), fallback_fuel_columns());
         let header = widener.header();
-        assert_eq!(header.len(), 98 + 3 * 35 + 1);
+        assert_eq!(header.len(), 98 + 1 + 1);
         // Headers carry RDW's display names, not its fieldName keys.
         assert_eq!(header[0], "Kenteken");
         assert!(
             header.contains(&"Gemiddelde Lading Waarde".to_string()),
             "the fallback list must carry display names, not gem_lading_wrde"
         );
-        assert!(header.iter().any(|h| h.starts_with("Brandstof 3 - ")));
+        assert_eq!(header[header.len() - 2], "Brandstof");
+        assert!(
+            !header.iter().any(|h| h.starts_with("Brandstof 1 - ")
+                || h.starts_with("Brandstof 2 - ")
+                || h.starts_with("Brandstof 3 - ")),
+            "the old per-slot fuel columns must not appear"
+        );
         assert_eq!(header.last().unwrap(), "Export status");
     }
 

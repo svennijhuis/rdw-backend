@@ -1,61 +1,56 @@
 //! Widens merge-joined vehicle+fuel rows into flat CSV rows.
 //!
-//! One output row per vehicle. Fuel columns are widened into `fuel1_*`,
-//! `fuel2_*`, `fuel3_*` (bounded to `MAX_FUEL_ENTRIES`, enforced upstream by
-//! `merge::merge_join`), rather than emitting a separate fuel sheet.
+//! One output row per vehicle. Fuel types from every RDW fuel row for that
+//! plate are joined into a single `Brandstof` column (e.g. a hybrid becomes
+//! `Benzine, Elektriciteit`) rather than repeating the vehicle or widening
+//! every fuel field into `Brandstof N - *` slots.
 
-use crate::merge::{WidenedRow, MAX_FUEL_ENTRIES};
+use crate::merge::WidenedRow;
 use crate::metadata::Column;
 
 /// Header label for the export-status column. Kept as a named constant so the
 /// header and any consumer looking the column up cannot drift apart.
 pub const EXPORT_STATUS_HEADER: &str = "Export status";
 
+/// Header label for the joined fuel-type column.
+pub const BRANDSTOF_HEADER: &str = "Brandstof";
+
+/// RDW field that holds the fuel-type display name on a fuel row.
+const BRANDSTOF_OMSCHRIJVING_FIELD: &str = "brandstof_omschrijving";
+
+/// Separator between fuel types in the `Brandstof` cell. A hybrid with petrol
+/// and electric therefore reads `Benzine, Elektriciteit`.
+const BRANDSTOF_SEPARATOR: &str = ", ";
+
 /// Column layout used to build the CSV header and to widen each row into
 /// exactly that column order.
 pub struct RowWidener {
     vehicle_columns: Vec<Column>,
-    /// Fuel dataset columns excluding `kenteken` (the join key, already
-    /// present via the vehicle columns).
-    fuel_columns: Vec<Column>,
 }
 
 impl RowWidener {
-    pub fn new(vehicle_columns: Vec<Column>, fuel_columns: Vec<Column>) -> Self {
-        let fuel_columns = fuel_columns
-            .into_iter()
-            .filter(|c| c.field != "kenteken")
-            .collect();
-        Self {
-            vehicle_columns,
-            fuel_columns,
-        }
+    /// `fuel_columns` is accepted so callers that already hold RDW fuel
+    /// metadata do not need a parallel constructor, but it is not emitted:
+    /// the CSV keeps a single joined `Brandstof` cell instead of one slot
+    /// per fuel-dataset field.
+    pub fn new(vehicle_columns: Vec<Column>, _fuel_columns: Vec<Column>) -> Self {
+        Self { vehicle_columns }
     }
 
-    /// Header row: vehicle columns, then each fuel slot, then the export
-    /// status last. The status column's position is final: it must never move
-    /// earlier, because `widen()` builds rows positionally and existing
-    /// consumers (and tests) assert fixed column indices for the 203-wide
-    /// vehicle+fuel prefix.
+    /// Header row: vehicle columns, then `Brandstof`, then the export status
+    /// last. The status column's position is final: it must never move
+    /// earlier, because `widen()` builds rows positionally.
     ///
-    /// Headers use RDW's own display names rather than its `fieldName` keys,
-    /// so a reader opening the CSV sees "Gemiddelde Lading Waarde" instead of
-    /// `gem_lading_wrde`. Fuel slots are prefixed "Brandstof N - " so all the
-    /// columns of one slot sort together.
+    /// Vehicle headers use RDW's own display names rather than its
+    /// `fieldName` keys, so a reader opening the CSV sees "Gemiddelde Lading
+    /// Waarde" instead of `gem_lading_wrde`.
     pub fn header(&self) -> Vec<String> {
         let mut header: Vec<String> = self
             .vehicle_columns
             .iter()
             .map(|c| neutralize_formula(c.display.clone()))
             .collect();
-        for slot in 1..=MAX_FUEL_ENTRIES {
-            for col in &self.fuel_columns {
-                header.push(neutralize_formula(format!(
-                    "Brandstof {slot} - {}",
-                    col.display
-                )));
-            }
-        }
+        header.push(BRANDSTOF_HEADER.to_string());
         header.push(EXPORT_STATUS_HEADER.to_string());
         header
     }
@@ -66,18 +61,26 @@ impl RowWidener {
         for col in &self.vehicle_columns {
             out.push(field_as_string(row.vehicle.0.get(&col.field)));
         }
-        for slot in 0..MAX_FUEL_ENTRIES {
-            let fuel = row.fuels.get(slot);
-            for col in &self.fuel_columns {
-                match fuel {
-                    Some(f) => out.push(field_as_string(f.0.get(&col.field))),
-                    None => out.push(String::new()),
-                }
-            }
-        }
+        out.push(joined_brandstof(&row.fuels));
         out.push(row.export_status.as_str().to_string());
         out
     }
+}
+
+/// Join every non-empty `brandstof_omschrijving` on this vehicle's fuel rows,
+/// in the order `merge_join` already sorted them (`brandstof_volgnummer`).
+fn joined_brandstof(fuels: &[rdw_client::FuelRow]) -> String {
+    let mut parts = Vec::new();
+    for fuel in fuels {
+        let raw = match fuel.0.get(BRANDSTOF_OMSCHRIJVING_FIELD) {
+            None | Some(serde_json::Value::Null) => continue,
+            Some(serde_json::Value::String(s)) if s.is_empty() => continue,
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(other) => other.to_string(),
+        };
+        parts.push(raw);
+    }
+    neutralize_formula(parts.join(BRANDSTOF_SEPARATOR))
 }
 
 fn field_as_string(value: Option<&serde_json::Value>) -> String {
@@ -146,85 +149,93 @@ mod tests {
         )
     }
 
+    fn vehicle(kenteken: &str, merk: &str) -> VehicleRow {
+        VehicleRow(
+            json!({ "kenteken": kenteken, "merk": merk })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    }
+
+    fn fuel(kenteken: &str, volgnummer: u32, omschrijving: &str) -> FuelRow {
+        FuelRow(
+            json!({
+                "kenteken": kenteken,
+                "brandstof_volgnummer": volgnummer.to_string(),
+                "brandstof_omschrijving": omschrijving
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )
+    }
+
     #[test]
-    fn header_excludes_kenteken_from_fuel_columns_and_widens_three_slots() {
+    fn header_is_vehicle_columns_then_one_brandstof_then_status() {
         let header = widener().header();
         assert_eq!(
             header,
-            vec![
-                "Kenteken",
-                "Merk",
-                "Brandstof 1 - Brandstof volgnummer",
-                "Brandstof 1 - Brandstof omschrijving",
-                "Brandstof 2 - Brandstof volgnummer",
-                "Brandstof 2 - Brandstof omschrijving",
-                "Brandstof 3 - Brandstof volgnummer",
-                "Brandstof 3 - Brandstof omschrijving",
-                "Export status",
-            ]
+            vec!["Kenteken", "Merk", "Brandstof", "Export status"]
         );
     }
 
     #[test]
-    fn zero_fuel_entries_widen_to_empty_fuel_columns() {
-        let vehicles = vec![VehicleRow(
-            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        )];
-        let widened = merge_join(&vehicles, &[], false).unwrap();
+    fn zero_fuel_entries_widen_to_empty_brandstof() {
+        let widened = merge_join(&[vehicle("AA001A", "TOYOTA")], &[], false).unwrap();
+        let row = widener().widen(&widened[0]);
+        assert_eq!(row, vec!["AA001A", "TOYOTA", "", "no_fuel_data"]);
+    }
+
+    #[test]
+    fn one_fuel_entry_fills_brandstof_with_the_omschrijving() {
+        let vehicles = vec![vehicle("AA001A", "TOYOTA")];
+        let fuels = vec![fuel("AA001A", 1, "Benzine")];
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
+        let row = widener().widen(&widened[0]);
+        assert_eq!(row, vec!["AA001A", "TOYOTA", "Benzine", "ok"]);
+    }
+
+    #[test]
+    fn hybrid_joins_both_fuel_types_in_one_column() {
+        // Toyota Prius shape: one plate, two RDW fuel rows.
+        let vehicles = vec![vehicle("00GBX4", "TOYOTA")];
+        let fuels = vec![
+            fuel("00GBX4", 1, "Benzine"),
+            fuel("00GBX4", 2, "Elektriciteit"),
+        ];
+        let widened = merge_join(&vehicles, &fuels, false).unwrap();
+        assert_eq!(widened.len(), 1, "a hybrid is still one output row");
         let row = widener().widen(&widened[0]);
         assert_eq!(
             row,
-            vec!["AA001A", "TOYOTA", "", "", "", "", "", "", "no_fuel_data"]
+            vec!["00GBX4", "TOYOTA", "Benzine, Elektriciteit", "ok"]
         );
     }
 
     #[test]
-    fn three_fuel_entries_populate_all_slots() {
-        let vehicles = vec![VehicleRow(
-            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        )];
-        let fuels: Vec<FuelRow> = (1..=3)
-            .map(|n| {
-                FuelRow(
-                    json!({ "kenteken": "AA001A", "brandstof_volgnummer": n.to_string(), "brandstof_omschrijving": format!("Benzine{n}") })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                )
-            })
-            .collect();
+    fn three_fuel_entries_are_joined_in_volgnummer_order() {
+        let vehicles = vec![vehicle("AA001A", "TOYOTA")];
+        let fuels = vec![
+            fuel("AA001A", 1, "Benzine"),
+            fuel("AA001A", 2, "Elektriciteit"),
+            fuel("AA001A", 3, "CNG"),
+        ];
         let widened = merge_join(&vehicles, &fuels, false).unwrap();
         let row = widener().widen(&widened[0]);
-        // Existing positional assertions on the vehicle/fuel prefix must
-        // stay unchanged: the status column is appended, never inserted.
-        assert_eq!(row[2], "1");
-        assert_eq!(row[3], "Benzine1");
-        assert_eq!(row[6], "3");
-        assert_eq!(row[7], "Benzine3");
+        assert_eq!(
+            row[2], "Benzine, Elektriciteit, CNG",
+            "all types land in the one Brandstof cell"
+        );
+        assert_eq!(*row.last().unwrap(), "ok");
     }
 
     // Criterion 2: export_status column at the final position, three values.
 
     #[test]
     fn happy_path_status_column_is_last_and_ok_when_fuel_present() {
-        let vehicles = vec![VehicleRow(
-            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        )];
-        let fuels = vec![FuelRow(
-            json!({ "kenteken": "AA001A", "brandstof_volgnummer": "1", "brandstof_omschrijving": "Benzine" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        )];
+        let vehicles = vec![vehicle("AA001A", "TOYOTA")];
+        let fuels = vec![fuel("AA001A", 1, "Benzine")];
         let widened = merge_join(&vehicles, &fuels, false).unwrap();
         let row = widener().widen(&widened[0]);
         let header = widener().header();
@@ -236,33 +247,22 @@ mod tests {
 
     #[test]
     fn edge_status_column_is_no_fuel_data_when_fetch_succeeded_with_zero_rows() {
-        let vehicles = vec![VehicleRow(
-            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        )];
-        let widened = merge_join(&vehicles, &[], false).unwrap();
+        let widened = merge_join(&[vehicle("AA001A", "TOYOTA")], &[], false).unwrap();
         let row = widener().widen(&widened[0]);
         assert_eq!(*row.last().unwrap(), "no_fuel_data");
     }
 
     #[test]
     fn failure_status_column_is_fuel_unavailable_when_range_fetch_failed() {
-        let vehicles = vec![VehicleRow(
-            json!({ "kenteken": "AA001A", "merk": "TOYOTA" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        )];
-        let widened = merge_join(&vehicles, &[], true).unwrap();
+        let widened = merge_join(&[vehicle("AA001A", "TOYOTA")], &[], true).unwrap();
         let row = widener().widen(&widened[0]);
         assert_eq!(*row.last().unwrap(), "fuel_unavailable");
-        // Fuel columns stay blank, exactly like the no_fuel_data case; only
+        // Brandstof stays blank, exactly like the no_fuel_data case; only
         // the status column distinguishes fetch failure from genuine
         // absence.
-        assert_eq!(&row[2..8], ["", "", "", "", "", ""]);
+        assert_eq!(row[2], "");
     }
+
     #[test]
     fn happy_path_ordinary_values_are_left_untouched() {
         for v in ["Benzine", "TOYOTA", "00GBX4", "104", "1.5", ""] {
@@ -307,18 +307,8 @@ mod tests {
     #[test]
     fn failure_formula_in_a_data_value_reaches_the_csv_escaped() {
         let widener = widener();
-        let vehicle = VehicleRow(
-            json!({ "kenteken": "AA001A", "merk": "=cmd|'/c calc'!A1" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
-        let fuel = FuelRow(
-            json!({ "kenteken": "AA001A", "brandstof_volgnummer": "1", "brandstof_omschrijving": "Benzine" })
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
+        let vehicle = vehicle("AA001A", "=cmd|'/c calc'!A1");
+        let fuel = fuel("AA001A", 1, "Benzine");
         let rows = merge_join(&[vehicle], &[fuel], false).unwrap();
         let widened = widener.widen(&rows[0]);
         let merk = &widened[1];

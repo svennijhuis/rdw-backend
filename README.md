@@ -43,17 +43,18 @@ Error bodies render as a small HTML page when the client prefers HTML, and as pl
 
 ## The CSV
 
-One row per vehicle, 204 columns: the 98 vehicle columns, then three fuel slots of 35 columns each,
-then an export-status column.
+One row per vehicle: the 98 vehicle columns, then one `Brandstof` column, then an export-status
+column.
 
-Headers use RDW's own display names rather than its internal field keys, so a column reads
-`Brandstof 3 - CO2 uitstoot gecombineerd`, not `fuel3_co2_uitstoot_gecombineerd`. The Dutch names
-come from RDW and are not translated here.
+Vehicle headers use RDW's own display names rather than its internal field keys, so a column reads
+`Gemiddelde Lading Waarde`, not `gem_lading_wrde`. The Dutch names come from RDW and are not
+translated here.
 
-A vehicle can hold up to three fuel entries — a hybrid has two, for example petrol and electric —
-and these are widened into the three slots rather than repeating the vehicle across several rows.
-A fourth entry has never appeared in the data; if one ever does, the export fails loudly instead of
-silently dropping it.
+A vehicle can hold up to three fuel entries — a hybrid has two, for example petrol and electric.
+Those types are joined in `Brandstof` with a comma (`Benzine, Elektriciteit`) rather than repeating
+the vehicle across several rows or widening every RDW fuel field into extra columns. A fourth entry
+has never appeared in the data; if one ever does, the export fails loudly instead of silently
+dropping it.
 
 The last column says how complete each row is:
 
@@ -61,7 +62,7 @@ The last column says how complete each row is:
 |---|---|
 | `ok` | Fuel data was fetched for this vehicle |
 | `no_fuel_data` | The fetch succeeded, but RDW genuinely holds no fuel rows for this plate |
-| `fuel_unavailable` | The fetch failed, so the fuel columns are blank for a reason unrelated to the vehicle |
+| `fuel_unavailable` | The fetch failed, so `Brandstof` is blank for a reason unrelated to the vehicle |
 
 That distinction matters: without it, a vehicle with no fuel data and a vehicle whose data failed to
 load both look like empty cells.

@@ -20,4 +20,4 @@ pub use metadata::{
 };
 pub use ranges::{fixed_two_char_bands, KentekenRange};
 pub use rate_limit::{RateLimitOutcome, RateLimiter, DAY_LIMIT, WEEK_LIMIT};
-pub use widen::{RowWidener, EXPORT_STATUS_HEADER};
+pub use widen::{RowWidener, BRANDSTOF_HEADER, EXPORT_STATUS_HEADER};
